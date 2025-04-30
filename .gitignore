@@ -1,4 +1,5 @@
 build/
 diff_gaussian_rasterization.egg-info/
 dist/
-diff_gaussian_rasterization/*
+diff-gaussian-rasterization/*
+third_party/*
