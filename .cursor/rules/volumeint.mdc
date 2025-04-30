@@ -1,0 +1,37 @@
+---
+description: Volume Integration of axis aligned cube grids over a scene hashgrid
+globs: 
+---
+
+
+## Core Concept
+The method aims to render scenes by integrating a field derived from a **vector potential (Φ)** stored in a global hashgrid, modulated by locally defined occupancy/confidence properties stored within scene primitives. It uses an alternative volume integral formulation.
+
+## 2. Scene Representation
+* **Global Representation:** A multi-resolution hashgrid stores features representing a **vector potential (Φ)** across the scene volume.
+* **Local Representation:** The scene is composed of **primitives**, defined as axis-aligned cubes of uniform size. Each primitive contains its own local grid storing **confidence scores (X)**.
+
+## 3. Rendering Pipeline
+* **View Casting:** For each pixel, a viewing pyramid is defined.
+* **Primitive Culling & Sorting:**
+    * Primitives intersecting the viewing frustum are identified.
+    * **Tile-Based Sorting:** These primitives are depth-sorted on a per-tile basis, reusing logic and efficiency patterns from **3D Gaussian Splatting's rasterization pipeline**.
+* **Parallel Rendering:** Rendering is performed tile-by-tile. Within each tile block, computation for each pixel is handled by a **dedicated thread processing its corresponding viewing pyramid/ray** against the sorted primitive list for that tile.
+
+## 4. Feature Integration (Primary Method)
+* **Volume Integral Formulation:** Pixel values are computed by evaluating a volume integral with the product of potential and the gradient of occupancy
+* **Inputs:**
+    * **Vector Potential (Φ):** Interpolated from the global multi-resolution hashgrid at the confidence grid positions.
+    * **Occupancy Gradient (∇X):** Derived for each primitive. The confidence scores (X) stored in the primitive's grid are thresholded to determine local occupancy, and its gradient (∇X) is computed using stencil methods.
+* **Rendering:** The volume integral of a primitive is a feature of dim D = hashgrid_levels*hash_dim which we multiply by a linear layer of shape D,8. The 8 dim is from view-independent radiance, view-dep feature, density. We then alpha blend these using the density and find pixelwise diffuse rgb and spec features that we give to a cnn or mlp outside of the cuda kernel.
+
+## 6. Key Implementation Aspects
+* **Framework:** The forward pass builds on top of the Gaussian Splatting tile sort. We are not writing the backward pass yet, only implementing and profiling the speed of the fw pass.
+
+We start our implementation from the forward passes in [integrator_impl.cu](mdc:cuda_integrator/integrator_impl.cu), [forward.cu](mdc:cuda_integrator/forward.cu) and then work on the headers, then the rest of the files.
+
+
+
+
+
+

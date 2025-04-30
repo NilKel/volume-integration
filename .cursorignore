@@ -1,0 +1,8 @@
+# Add directories or file patterns to ignore during indexing (e.g. foo/ or *.csv)
+/home/nilkel/Projects/volume_integration/third_party/*
+/home/nilkel/Projects/volume_integration/build/*
+/home/nilkel/Projects/volume_integration/cmake-build-debug/*
+/home/nilkel/Projects/volume_integration/cmake-build-release/*
+/home/nilkel/Projects/volume_integration/cmake-build-release-debug/*
+/home/nilkel/Projects/volume_integration/cmake-build-release-debug-coverage/*
+/home/nilkel/Projects/volume_integration/diff-gaussian-rasterization/*
