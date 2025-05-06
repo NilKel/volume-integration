@@ -67,25 +67,22 @@ namespace CudaIntegrator
 
 		// Backward declaration
 		void backward(
-			// Buffer allocation callbacks
-			std::function<char* (size_t)> geometryBuffer,
+			std::function<char* (size_t)> geomBuffer,
 			std::function<char* (size_t)> binningBuffer,
 			std::function<char* (size_t)> imageBuffer,
-			std::function<char* (size_t)> tempBuffer,     // Callback for temporary gradient buffers
-			// Primitive count & Dimensions from Forward
 			const int P,
+			const int num_rendered,
 			const int width, int height,
-			// Input Data Pointers (matching forward pass)
 			const float* means3D,
-			const float primitive_scale, // Assuming fixed, not differentiated
+			const float primitive_scale,
 			const float* viewmatrix,
 			const float* projmatrix,
 			const float* camera_center_vec,
 			const float near_plane,
 			const float max_distance,
 			const float tan_fovx, float tan_fovy,
-			const float* primitive_confidences, // Corresponds to 'X'
-			const float* feature_table,         // Corresponds to 'Φ'
+			const float* primitive_confidences,
+			const float* feature_table,
 			const int* resolution,
 			const int* do_hash,
 			const int* primes,
@@ -97,27 +94,18 @@ namespace CudaIntegrator
 			const int max_primitives_per_ray,
 			const float occupancy_threshold,
 			const float* bg_color,
-			// --- Saved Forward Pass Data (PLACEHOLDERS - Ensure these are saved and passed) ---
-			const float* forward_primitive_features_7D, // Output of linear layer (P * 7)
-			const float* forward_primitive_alphas,      // Output of sigmoid (P)
-			const float* forward_final_Ts,              // Final transmittance per pixel (W * H)
-			const float* forward_primitive_features_D,  // Input to linear layer (P * D)
-			// --- Runtime Dimensions ---
-			const uint32_t input_feature_dim,      // D
-			const uint32_t output_feature_dim,     // Assumed 4 (for features part of 7D)
-			const uint32_t hashgrid_levels,        // L
-			const uint32_t num_output_channels,    // Assumed 3 (for color part of 7D)
-			const uint32_t feature_table_size,     // Needed for backwardFeatureAndConfidence
-			// --- Input Gradients ---
-			const float* dL_dout_color,            // Gradient w.r.t final color (W * H * 3)
-			const float* dL_dout_features,         // Gradient w.r.t final features (W * H * 4)
-			// --- Output Gradients (to be computed) ---
+			const uint32_t input_feature_dim,
+			const uint32_t output_feature_dim,
+			const uint32_t hashgrid_levels,
+			const uint32_t num_output_channels,
+			const uint32_t feature_table_size,
+			const float* dL_dout_color,
+			const float* dL_dout_features,
 			float* dL_dmeans3D,
-			float* dL_dprimitive_confidences,    // Output: dL_dX
-			float* dL_dfeature_table,          // Output: dL_dΦ
+			float* dL_dprimitive_confidences,
+			float* dL_dfeature_table,
 			float* dL_dlinear_weights,
 			float* dL_dlinear_bias,
-			// Add other outputs if needed (e.g., dL_dprimitive_scale)
 			cudaStream_t stream,
 			bool debug
 		);
@@ -129,6 +117,33 @@ namespace CudaIntegrator
 			float* viewmatrix,
 			float* projmatrix,
 			bool* present);
+
+	private:
+		// Internal state, buffer management, etc.
+		bool debug;
+		size_t P; // Number of primitives
+		size_t N; // Number of pixels
+
+		// Buffer sizes
+		size_t geometryStateSize;
+		size_t binningStateSize;
+		size_t imageStateSize;
+		size_t sortingMemorySize; // Assuming this exists if sortingMemory accessor does
+
+		// Device buffers
+		char* geomBuffer_device;
+		char* binningBuffer_device;
+		char* imageBuffer_device;
+		char* sortingMemory_device; // Assuming this exists
+
+		// Buffer accessors (using std::function for flexibility)
+		std::function<char*(size_t)> geomBuffer;      // <<< MUST BE DECLARED
+		std::function<char*(size_t)> binningBuffer;   // <<< MUST BE DECLARED
+		std::function<char*(size_t)> imageBuffer;     // <<< MUST BE DECLARED
+		std::function<char*(size_t)> sortingMemory;   // <<< MUST BE DECLARED (if used)
+
+		// Helper to allocate buffer and return accessor function
+		void setupBuffer(char*& buffer_ptr, size_t& buffer_size, size_t required_size, std::function<char*(size_t)>& accessor);
 	};
 };
 

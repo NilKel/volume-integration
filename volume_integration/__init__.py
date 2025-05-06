@@ -186,7 +186,8 @@ class _IntegratePrimitives(Function):
             means3D, primitive_confidences_flat, feature_table, linear_weights, linear_bias,
             viewmatrix, projmatrix, cam_pos, resolution, do_hash, primes, bg_color,
             # State Buffers from forward
-            geomBuffer, binningBuffer, imgBuffer
+            geomBuffer, binningBuffer, imgBuffer,
+            visibility_info
         )
         # Store non-tensor settings and intermediate info in ctx
         ctx.integration_settings = integration_settings
@@ -201,68 +202,113 @@ class _IntegratePrimitives(Function):
         # --- Retrieve saved tensors and settings ---
         ( means3D, primitive_confidences_flat, feature_table, linear_weights, linear_bias,
           viewmatrix, projmatrix, cam_pos, resolution, do_hash, primes, bg_color,
-          geomBuffer, binningBuffer, imgBuffer ) = ctx.saved_tensors
+          geomBuffer, binningBuffer, imgBuffer,
+          # visibility_info is saved but not passed to C++ backward
+          _visibility_info_saved ) = ctx.saved_tensors # Renamed to avoid confusion
         settings = ctx.integration_settings
         original_confidences_shape = ctx.original_confidences_shape
+        num_rendered = ctx.num_rendered
+        P = means3D.shape[0]
+
+        # Check which inputs require gradients
+        needs_means3D_grad = ctx.needs_input_grad[0]
+        needs_confidences_grad = ctx.needs_input_grad[1]
+        needs_features_grad = ctx.needs_input_grad[2]
+        needs_weights_grad = ctx.needs_input_grad[3]
+        needs_bias_grad = ctx.needs_input_grad[4]
+        # integration_settings (arg 5) never needs grad
+
+        # Initialize gradient outputs to None
+        dL_dmeans3D = None
+        dL_dprimitive_confidences = None
+        dL_dfeature_table = None
+        dL_dlinear_weights = None
+        dL_dlinear_bias = None
 
         # --- Check if backward pass is implemented ---
         if not hasattr(cuda_integrator, "integrate_primitives_backward"):
              raise NotImplementedError("Backward pass for volume integration is not implemented in the CUDA extension.")
 
+        # --- Early exit if no gradients are needed for relevant inputs ---
+        if not any([needs_means3D_grad, needs_confidences_grad, needs_features_grad, needs_weights_grad, needs_bias_grad]):
+            print("Skipping backward pass: No relevant inputs require gradients.")
+            # Return None for all inputs that could require grad
+            return (None, None, None, None, None, None)
+
         # Ensure input gradients are contiguous
         grad_out_color = grad_out_color.contiguous()
         grad_out_features = grad_out_features.contiguous()
-        # grad_out_visibility is often not needed or None, handle appropriately if used
 
         # --- Prepare arguments for C++ backward call ---
-        # Order must match integrate_primitives.h backward
         grad_args = (
-            # Input Gradients
             grad_out_color,
             grad_out_features,
-            # Saved State Buffers
             geomBuffer,
             binningBuffer,
             imgBuffer,
-            # Saved Original Inputs
-            means3D, primitive_confidences_flat, settings.primitive_scale,
-            viewmatrix, projmatrix, cam_pos,
-            settings.tanfovx, settings.tanfovy,
-            settings.image_height, settings.image_width,
-            settings.near_plane, settings.max_distance,
-            feature_table, resolution, do_hash, primes, settings.feature_offset,
-            linear_weights, linear_bias,
-            settings.stencil_genus, settings.grid_size, settings.max_primitives_per_ray,
-            settings.occupancy_threshold, bg_color,
-            # Runtime Dimensions
-            settings.input_feature_dim, settings.output_feature_dim,
-            settings.hashgrid_levels, settings.num_output_channels,
-            feature_table.numel(), # Pass total size
-            # Misc
+            means3D,
+            primitive_confidences_flat,
+            settings.primitive_scale,
+            viewmatrix,
+            projmatrix,
+            cam_pos,
+            settings.tanfovx,
+            settings.tanfovy,
+            settings.image_height,
+            settings.image_width,
+            settings.near_plane,
+            settings.max_distance,
+            feature_table,
+            resolution,
+            do_hash,
+            primes,
+            settings.feature_offset,
+            linear_weights,
+            linear_bias,
+            settings.stencil_genus,
+            settings.grid_size,
+            settings.max_primitives_per_ray,
+            settings.occupancy_threshold,
+            bg_color,
+            settings.input_feature_dim,
+            settings.output_feature_dim,
+            settings.hashgrid_levels,
+            settings.num_output_channels,
+            feature_table.numel(),
+            P,
+            num_rendered,
             settings.debug
         )
 
         # --- Call C++ backward function ---
-        # Returns grads for: means3D, primitive_confidences, feature_table, linear_weights, linear_bias
-        dL_dmeans3D, dL_dprimitive_confidences_flat, dL_dfeature_table, \
-        dL_dlinear_weights, dL_dlinear_bias = cuda_integrator.integrate_primitives_backward(*grad_args)
+        # The C++ function returns 5 tensors. Assign them to temporary variables.
+        cpp_dL_dmeans3D, cpp_dL_dprimitive_confidences_flat, cpp_dL_dfeature_table, \
+        cpp_dL_dlinear_weights, cpp_dL_dlinear_bias = cuda_integrator.integrate_primitives_backward(*grad_args)
 
-        # --- Reshape confidence gradient if necessary ---
-        if original_confidences_shape is not None:
-            dL_dprimitive_confidences = dL_dprimitive_confidences_flat.view(original_confidences_shape)
-        else:
-            dL_dprimitive_confidences = dL_dprimitive_confidences_flat
+        # --- Assign gradients to output variables only if required ---
+        if needs_means3D_grad:
+            # Note: cpp_dL_dmeans3D is currently zero until backward preprocess is implemented
+            dL_dmeans3D = cpp_dL_dmeans3D
+        if needs_confidences_grad:
+            if original_confidences_shape is not None:
+                dL_dprimitive_confidences = cpp_dL_dprimitive_confidences_flat.view(original_confidences_shape)
+            else:
+                dL_dprimitive_confidences = cpp_dL_dprimitive_confidences_flat
+        if needs_features_grad:
+            dL_dfeature_table = cpp_dL_dfeature_table
+        if needs_weights_grad:
+            dL_dlinear_weights = cpp_dL_dlinear_weights
+        if needs_bias_grad:
+            dL_dlinear_bias = cpp_dL_dlinear_bias
 
-        # --- Return gradients ---
-        # Must return gradients for each input of the forward function in the same order
-        # Return None for inputs that don't require gradients (like integration_settings)
+        # --- Return gradients corresponding to forward inputs ---
         return (
             dL_dmeans3D,
             dL_dprimitive_confidences,
             dL_dfeature_table,
             dL_dlinear_weights,
             dL_dlinear_bias,
-            None # Gradient for integration_settings is None
+            None # Gradient for integration_settings (always None)
         )
 
 class VolumeIntegrator(nn.Module):

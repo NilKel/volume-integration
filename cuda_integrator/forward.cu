@@ -13,6 +13,7 @@
 #include "auxiliary.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include "hashgrid.h"
 namespace cg = cooperative_groups;
 
 // Commenting out defines related to rendering kernel for now
@@ -21,155 +22,6 @@ namespace cg = cooperative_groups;
 
 
 // <<< NEW HELPER FUNCTIONS START >>> (Commented out as they are for rendering)
-
-// Hash interpolation function (from reference code)
-// Takes runtime dimensions as arguments. Assumes feature_table layout: entry * F * L + f * L + level
-__device__ void hashInterpolate(
-    const float3& pos,
-    const int level,
-    const float* __restrict__ feature_table, // Base pointer for the entire table
-    const int* __restrict__ resolutions, // Array of resolutions per level
-    const int feature_offset, // Max entries per level (T parameter)
-    const int do_hash, // Flag indicating if hashing is used for this level
-    const int* __restrict__ primes, // Hashing primes {p1, p2, p3}
-    float* __restrict__ output_features, // Output array (size input_feature_dim)
-    // Runtime dimensions
-    const uint32_t input_feature_dim,
-    const uint32_t hashgrid_levels) {
-
-    // Get resolution for this level
-    int res = resolutions[level];
-
-    // Calculate grid position relative to this level's grid (assuming pos is in [0,1]^3)
-    // If pos is in world coords, it needs normalization first based on scene bounds.
-    // Assuming pos is already normalized to [0, 1]^3 for hashgrid lookup.
-    float3 grid_pos_norm = { pos.x * res, pos.y * res, pos.z * res };
-
-    // Get integer grid coordinates of the bottom-left-back corner
-    int3 grid_min = {
-        static_cast<int>(floorf(grid_pos_norm.x)),
-        static_cast<int>(floorf(grid_pos_norm.y)),
-        static_cast<int>(floorf(grid_pos_norm.z))
-    };
-
-    // Calculate interpolation weights (distances from grid_min)
-    float3 t = {
-        grid_pos_norm.x - grid_min.x,
-        grid_pos_norm.y - grid_min.y,
-        grid_pos_norm.z - grid_min.z
-    };
-
-    // Initialize output features for this level to zero
-    for (uint32_t f = 0; f < input_feature_dim; ++f) {
-        output_features[f] = 0.0f;
-    }
-
-    // Trilinear interpolation over the 8 corners of the voxel
-    for (int dx = 0; dx < 2; dx++) {
-        float wx = (dx == 0) ? (1.0f - t.x) : t.x;
-        for (int dy = 0; dy < 2; dy++) {
-            float wy = (dy == 0) ? (1.0f - t.y) : t.y;
-            for (int dz = 0; dz < 2; dz++) {
-                float wz = (dz == 0) ? (1.0f - t.z) : t.z;
-                float w = wx * wy * wz; // Interpolation weight for this corner
-
-                // Calculate integer grid coordinates of the corner
-                int3 corner_idx = { grid_min.x + dx, grid_min.y + dy, grid_min.z + dz };
-
-                // Get feature index for this corner
-                uint32_t feature_entry_index; // Index within this level's feature entries
-
-                if (do_hash) {
-                    // Hash-based indexing
-                    uint32_t hash_val = 0;
-                    hash_val ^= (uint32_t)corner_idx.x * primes[0];
-                    hash_val ^= (uint32_t)corner_idx.y * primes[1];
-                    hash_val ^= (uint32_t)corner_idx.z * primes[2];
-                    feature_entry_index = hash_val % feature_offset; // feature_offset is T (hash table size)
-                } else {
-                    // Direct indexing (dense grid)
-                    // Check bounds: corner coords must be within [0, res-1]
-                    if (corner_idx.x < 0 || corner_idx.x >= res ||
-                        corner_idx.y < 0 || corner_idx.y >= res ||
-                        corner_idx.z < 0 || corner_idx.z >= res) {
-                        // If out of bounds for dense grid, contribute zero
-                        // (Or could implement clamping/wrapping if desired)
-                        continue;
-                    }
-                    feature_entry_index = (uint32_t)corner_idx.z * res * res + (uint32_t)corner_idx.y * res + (uint32_t)corner_idx.x;
-                     // Ensure index is within the expected dense grid size (res^3)
-                    if (feature_entry_index >= (uint32_t)res*res*res) continue; // Should not happen if bounds check passes
-                }
-
-                // Accumulate weighted features
-                // Indexing: entry_index*F*L + f*L + level
-                // Assumes feature_table stores features grouped by entry, then feature dim, then level
-                uint32_t base_idx = feature_entry_index * input_feature_dim * hashgrid_levels;
-                for (uint32_t f = 0; f < input_feature_dim; f++) {
-                     // Check bounds implicitly via loop condition
-                     // Calculate the final index for the feature
-                     uint32_t feature_idx = base_idx + f * hashgrid_levels + level;
-                     // TODO: Add bounds check for feature_idx against total size of feature_table if necessary
-                     output_features[f] += w * feature_table[feature_idx];
-                }
-            }
-        }
-    }
-}
-
-
-// Check if a 3D point (world space) is within the pyramidal frustum of a specific pixel.
-// This is a simplified check using NDC coordinates. More robust checks might involve plane equations.
-__device__ bool isPointInPyramidalFrustum(
-    const float3& point_world,
-    const float* __restrict__ viewmatrix,
-    const float* __restrict__ projmatrix,
-    const int W, const int H,
-    const uint2& pixel_coord, // Integer coordinates of the pixel (x, y)
-    const float near_plane, // Near plane distance (positive value)
-    const float max_distance) // Far plane distance (positive value)
-{
-    // 1. Transform point to View Space
-    float4 point_view_h = transformPoint4x4(point_world, viewmatrix);
-    float3 point_view = { point_view_h.x, point_view_h.y, point_view_h.z };
-
-    // 2. Check Near and Far Planes (in View Space Z)
-    // View space Z is typically negative. We use -Z for distance.
-    float view_depth = -point_view.z;
-    if (view_depth < near_plane || view_depth > max_distance) {
-        return false;
-    }
-
-    // 3. Transform point to Homogeneous Clip Space
-    float4 point_clip = transformPoint4x4(point_world, projmatrix);
-
-    // 4. Check if behind camera (W <= 0) - Optional but good practice
-    if (point_clip.w <= 1e-6f) {
-        return false;
-    }
-
-    // 5. Perspective Divide to Normalized Device Coordinates (NDC) [-1, 1]
-    float inv_w = 1.0f / point_clip.w;
-    float ndc_x = point_clip.x * inv_w;
-    float ndc_y = point_clip.y * inv_w;
-    // float ndc_z = point_clip.z * inv_w; // Z check already done via view_depth
-
-    // 6. Convert NDC to Pixel Coordinates (Float) [0, W] x [0, H]
-    // Assumes standard NDC to Pixel mapping (adjust if different)
-    // Y is often flipped depending on API/convention (here assuming Y=0 is top)
-    float pix_fx = (ndc_x * 0.5f + 0.5f) * W;
-    float pix_fy = (1.0f - (ndc_y * 0.5f + 0.5f)) * H; // Y flipped
-
-    // 7. Check if the floating-point pixel coordinate falls within the boundaries of the target integer pixel
-    // Check if pix_f is within [pixel_coord.x, pixel_coord.x + 1) and [pixel_coord.y, pixel_coord.y + 1)
-    // Add a small tolerance (epsilon) if needed for edge cases, but strict check is usually fine.
-    bool within_x = (pix_fx >= pixel_coord.x && pix_fx < (pixel_coord.x + 1.0f));
-    bool within_y = (pix_fy >= pixel_coord.y && pix_fy < (pixel_coord.y + 1.0f));
-
-    return within_x && within_y;
-}
-
-// <<< NEW HELPER FUNCTIONS END >>>
 
 // Perform initial steps for each primitive prior to sorting.
 __global__ void preprocessCUDA(int P,
@@ -302,10 +154,14 @@ renderCUDA(
     float* __restrict__ out_color,             // Output color image (CHANNELS, H, W)
     float* __restrict__ out_features,          // Output feature image (output_feature_dim, H, W) - Optional
     float* __restrict__ visibility_info,       // Output visibility (1-T) or accumulated alpha (H, W) - Optional
+    float* __restrict__ out_final_transmittance,   // Stores final T per pixel (W*H)
+    int* __restrict__ out_num_contrib_per_pixel,     // Stores count per pixel (W*H)
+    int* __restrict__ out_pixel_contributing_indices, // Stores primitive index per pixel contribution (W*H*max_primitives_per_ray)
+    float* __restrict__ out_delta_t,                 // Stores delta_t per pixel contribution (W*H*max_primitives_per_ray)
     // Runtime dimensions
-    const uint32_t input_feature_dim,       // Feature dimension F in hashgrid
-    const uint32_t output_feature_dim,      // Feature dimension requested in output (excluding RGB, density)
-    const uint32_t hashgrid_levels          // Number of hashgrid levels L
+    const uint32_t input_feature_dim,
+    const uint32_t output_feature_dim,
+    const uint32_t hashgrid_levels
 )
 {
     // <<< Read camera center from pointer inside kernel >>>
@@ -318,15 +174,15 @@ renderCUDA(
     const uint32_t MAX_OUTPUT_FEATURE_DIM = 4; // F_out_max: Max requested output feature dim (excluding RGB, density)
     const uint32_t MAX_HASHGRID_LEVELS = 8;    // L_max: Max hashgrid levels
     const uint32_t MAX_GRID_SIZE = 5;           // Max dimension of confidence grid (e.g., 5 for 5x5x5) - ADJUST AS NEEDED
-    const uint32_t MAX_GRID_VOLUME = MAX_GRID_SIZE * MAX_GRID_SIZE * MAX_GRID_SIZE; // Max total elements in confidence grid
+    // const uint32_t MAX_GRID_VOLUME = MAX_GRID_SIZE * MAX_GRID_SIZE * MAX_GRID_SIZE; // Max total elements in confidence grid
 
-    // Max dimension of the MLP output (RGB + Density + Output Features)
-    const uint32_t MAX_OUTPUT_LINEAR_DIM = CHANNELS + MAX_OUTPUT_FEATURE_DIM + 1;
-    // Max dimension of the MLP input (Concatenated features from all levels)
-    const uint32_t MAX_INPUT_LINEAR_DIM = MAX_INPUT_FEATURE_DIM * MAX_HASHGRID_LEVELS;
+    // // Max dimension of the MLP output (RGB + Density + Output Features)
+    // const uint32_t MAX_OUTPUT_LINEAR_DIM = CHANNELS + MAX_OUTPUT_FEATURE_DIM + 1;
+    // // Max dimension of the MLP input (Concatenated features from all levels)
+    // const uint32_t MAX_INPUT_LINEAR_DIM = MAX_INPUT_FEATURE_DIM * MAX_HASHGRID_LEVELS;
 
-    // Max size for the stencil coefficients array (e.g., 5 for genus 2)
-    const uint32_t MAX_STENCIL_SIZE = 5;
+    // // Max size for the stencil coefficients array (e.g., 5 for genus 2)
+    // const uint32_t MAX_STENCIL_SIZE = 5;
 
     // --- Runtime Dimension Calculations ---
     // Total number of elements in the confidence grid (e.g., 3*3*3 = 27)
@@ -471,11 +327,6 @@ renderCUDA(
         // View space depth is typically negative Z
         float view_depth = p_view.z;
 
-        // // Check near/far plane culling based on view depth
-        // if (view_depth < near_plane || view_depth > max_distance) {
-        //     continue; // Skip primitive if its center is outside the view depth range
-        // }
-
         // Calculate step size along the ray based on view depth difference
         float delta_t_orig = max(0.0f, view_depth - last_view_depth);
 
@@ -499,7 +350,7 @@ renderCUDA(
 
         // == Cooperative Loading of Confidence Grid ==
         // Loop iterates up to the actual grid_volume needed for this primitive
-        for (uint32_t j = block.thread_rank(); j < grid_volume; j += block.size()) {
+        for (uint32_t j = 0; j < grid_volume; j ++) {
             // Bounds check shared memory write against MAX size
             if (j < MAX_GRID_VOLUME) {
                 // Read from global memory. Assume primitive_confidences is large enough
@@ -723,7 +574,7 @@ renderCUDA(
         }
 
         // --- Calculate Alpha and Composite ---
-        // Use the modified delta_t
+        // Use the calculated delta_t
         float alpha = 1.0f - expf(-primitive_density * delta_t);
         alpha = min(max(alpha, 0.0f), 1.0f);
         float weight = T * alpha;
@@ -742,6 +593,16 @@ renderCUDA(
 
         // Update Transmittance: T_new = T_old * (1 - alpha)
         T *= (1.0f - alpha);
+
+        // --- Store Primitive Index and Delta T for Backward Pass ---
+        if (inside && out_pixel_contributing_indices != nullptr && contributor_count < max_primitives_per_ray) {
+             int write_idx = pix_id * max_primitives_per_ray + contributor_count;
+             // Add bounds check if max_primitives_per_ray * W * H could exceed buffer size (shouldn't happen if allocated correctly)
+             out_pixel_contributing_indices[write_idx] = i;
+             if (out_delta_t != nullptr) {
+                 out_delta_t[write_idx] = delta_t;
+             }
+        }
 
         // --- Update State for Next Primitive ---
         last_view_depth = view_depth; // Still update with the original depth
@@ -773,6 +634,14 @@ renderCUDA(
         if (visibility_info != nullptr) {
             visibility_info[pix_id] = 1.0f - T;
         }
+
+        // <<< WRITE FINAL OUTPUTS (Transmittance and Count) >>>
+        if (out_final_transmittance != nullptr) {
+            out_final_transmittance[pix_id] = T;
+        }
+        if (out_num_contrib_per_pixel != nullptr) {
+            out_num_contrib_per_pixel[pix_id] = contributor_count;
+        }
     }
 }
 
@@ -784,7 +653,7 @@ void FORWARD::render(
 	int W, int H,
 	const float* viewmatrix,
 	const float* projmatrix,
-	const float* camera_center_vec, // Keep as float*
+	const float* camera_center_vec,
 	const float near_plane,
 	const float max_distance,
 	const float* primitive_centers,
@@ -800,19 +669,23 @@ void FORWARD::render(
 	const int stencil_genus,
 	const int grid_size,
 	const int max_primitives_per_ray,
-    const float occupancy_threshold, // NEW Parameter
+    const float occupancy_threshold,
 	const float* bg_color,
 	float* out_color,
 	float* out_features,
 	float* visibility_info,
+	float* out_final_transmittance,
+	int* out_num_contrib_per_pixel,
+	int* out_pixel_contributing_indices,
+    float* out_delta_t,
 	const uint32_t input_feature_dim,
 	const uint32_t output_feature_dim,
 	const uint32_t hashgrid_levels,
-	const uint32_t num_output_channels // Matches header
+	const uint32_t num_output_channels
 )
 {
-    printf("[FORWARD::render] About to launch renderCUDA kernel...\n"); // <<< Should be reached now >>>
-    fflush(stdout); // Ensure the print buffer is flushed
+    printf("[FORWARD::render] About to launch renderCUDA kernel...\n");
+    fflush(stdout);
 
 	// Determine which kernel template specialization to launch based on num_output_channels
 	if (num_output_channels == 3) {
@@ -822,7 +695,7 @@ void FORWARD::render(
 			W, H,
 			viewmatrix,
 			projmatrix,
-			camera_center_vec, // <<< PASS float* pointer directly >>>
+			camera_center_vec,
 			near_plane,
 			max_distance,
 			primitive_centers,
@@ -843,6 +716,10 @@ void FORWARD::render(
 			out_color,
 			out_features,
 			visibility_info,
+			out_final_transmittance,
+			out_num_contrib_per_pixel,
+			out_pixel_contributing_indices,
+            out_delta_t,
 			input_feature_dim,
 			output_feature_dim,
 			hashgrid_levels);
@@ -860,53 +737,36 @@ void FORWARD::render(
         printf("[FORWARD::render] renderCUDA kernel launch successful (or error check passed).\n");
         fflush(stdout);
     }
-
-    // Optional: Synchronize here if you want to ensure kernel completion before this function returns
-    // cudaDeviceSynchronize();
-    // printf("[FORWARD::render] renderCUDA kernel finished execution (if synchronized).\n");
-    // fflush(stdout);
-
-
-	// CHECK_CUDA(,debug); // Removed this problematic check
 }
-
-// ===================================================================================
-// == End of Rendering Code                                                        ==
-// ===================================================================================
 
 // Wrapper for the preprocess kernel launch. Updated signature.
 void FORWARD::preprocess(int P, // Removed D, M
-	const float* means3D,
-	// Removed scales, rotations, opacities, shs, clamped, cov3D_precomp, colors_precomp, cam_pos
-	const float primitive_scale,
+	const float* orig_points,
+	const float primitive_scale, // All primitives have the same scale
 	const float* viewmatrix,
 	const float* projmatrix,
 	const int W, int H,
 	const float focal_x, float focal_y,
 	const float tan_fovx, float tan_fovy,
 	int* radii,
-	float2* means2D,
+	float2* points_xy_image,
 	float* depths,
-	// Removed cov3Ds, rgb, conic_opacity
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered)
 {
 	preprocessCUDA << <(P + 255) / 256, 256 >> > ( // Removed template arg <NUM_CHANNELS>
 		P, // Removed D, M
-		means3D,
+		orig_points,
 		primitive_scale,
-		// Removed scales, scale_modifier, rotations, opacities, shs, clamped,
-		// cov3D_precomp, colors_precomp, cam_pos
 		viewmatrix,
 		projmatrix,
 		W, H,
 		tan_fovx, tan_fovy,
 		focal_x, focal_y,
 		radii,
-		means2D,
+		points_xy_image,
 		depths,
-		// Removed cov3Ds, rgb, conic_opacity
 		grid,
 		tiles_touched,
 		prefiltered

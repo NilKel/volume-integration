@@ -18,6 +18,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CUDA_STANDARD 17)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -G -lineinfo")
 
 add_library(CudaIntegratorLib
 	cuda_integrator/backward.h
@@ -34,3 +35,5 @@ set_target_properties(CudaIntegratorLib PROPERTIES CUDA_ARCHITECTURES "70;75;86"
 
 target_include_directories(CudaIntegratorLib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cuda_integrator)
 target_include_directories(CudaIntegratorLib PRIVATE third_party/glm ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+
+target_compile_options(CudaIntegratorLib PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-G -lineinfo>)

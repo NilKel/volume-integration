@@ -186,19 +186,20 @@ IntegratePrimitivesCUDA(
 
 
 // Backward pass function definition for PyTorch binding
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor
+>
 IntegratePrimitivesBackwardCUDA(
     // --- Input Gradients (from Python) ---
-    const torch::Tensor& dL_dout_color,         // (H, W, 3) or (3, H, W) - Ensure contiguous in Python
-    const torch::Tensor& dL_dout_features,      // (H, W, F_out) or (F_out, H, W) - Ensure contiguous
+    const torch::Tensor& dL_dout_color,
+    const torch::Tensor& dL_dout_features,
     // --- Saved Forward Pass Data (from Python ctx) ---
-    // State Buffers
-    const torch::Tensor& geomBuffer,            // Saved geometry state buffer
-    const torch::Tensor& binningBuffer,         // Saved binning state buffer
-    const torch::Tensor& imgBuffer,             // Saved image state buffer
-    // Original Inputs
+    const torch::Tensor& geomBuffer_t,      // Renamed to avoid conflict
+    const torch::Tensor& binningBuffer_t,   // Renamed to avoid conflict
+    const torch::Tensor& imgBuffer_t,       // Renamed to avoid conflict
+    // Original Inputs needed for backward
 	const torch::Tensor& means3D,
-	const torch::Tensor& primitive_confidences, // Flat (P, G^3)
+	const torch::Tensor& primitive_confidences, // This is the flat version passed from Python
 	const float primitive_scale,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
@@ -210,7 +211,7 @@ IntegratePrimitivesBackwardCUDA(
 	const float near_plane,
 	const float max_distance,
 	const torch::Tensor& feature_table,
-	const torch::Tensor& resolution,
+	const torch::Tensor& resolution_t,
 	const torch::Tensor& do_hash,
 	const torch::Tensor& primes,
 	const int feature_offset,
@@ -226,140 +227,106 @@ IntegratePrimitivesBackwardCUDA(
 	const uint32_t output_feature_dim,
 	const uint32_t hashgrid_levels,
 	const uint32_t num_output_channels,
-    const uint32_t feature_table_size, // Total elements in feature_table (T*L*F)
+    const uint32_t feature_table_size,
+    // --- Other Saved Context ---
+    const int P,
+    const int num_rendered,
 	// Misc
 	const bool debug
 )
 {
-    // // --- Input Tensor Checks ---
-    // CHECK_CUDA_INPUT(dL_dout_color);
-    // CHECK_CUDA_INPUT(dL_dout_features);
-    // CHECK_CUDA_INPUT(geomBuffer);    // Check saved state buffers too
-    // CHECK_CUDA_INPUT(binningBuffer);
-    // CHECK_CUDA_INPUT(imgBuffer);
-    // CHECK_CUDA_INPUT(means3D);
-    // CHECK_CUDA_INPUT(primitive_confidences);
-    // CHECK_CUDA_INPUT(viewmatrix);
-    // CHECK_CUDA_INPUT(projmatrix);
-    // CHECK_CUDA_INPUT(cam_pos);
-    // CHECK_CUDA_INPUT(feature_table);
-    // CHECK_CUDA_INPUT(resolution);
-    // CHECK_CUDA_INPUT(do_hash);
-    // CHECK_CUDA_INPUT(primes);
-    // CHECK_CUDA_INPUT(linear_weights);
-    // CHECK_CUDA_INPUT(linear_bias);
-    // CHECK_CUDA_INPUT(bg_color);
-
-
-    const int P = means3D.size(0);
-    const int H = image_height;
-    const int W = image_width;
-
-    // --- Options for creating new tensors ---
-    auto options_float = means3D.options().dtype(torch::kFloat32);
-    auto options_byte = means3D.options().dtype(torch::kUInt8);
-    torch::Device device(torch::kCUDA);
-
-    // --- Allocate Output Gradient Tensors ---
-    // Gradients should be zero-initialized as kernels might use atomic adds
-    torch::Tensor dL_dmeans3D = torch::zeros_like(means3D, options_float.device(device));
-    torch::Tensor dL_dprimitive_confidences = torch::zeros_like(primitive_confidences, options_float.device(device)); // Matches flat input
-    torch::Tensor dL_dfeature_table = torch::zeros_like(feature_table, options_float.device(device));
-    torch::Tensor dL_dlinear_weights = torch::zeros_like(linear_weights, options_float.device(device));
-    torch::Tensor dL_dlinear_bias = torch::zeros_like(linear_bias, options_float.device(device));
-    // Note: Gradient w.r.t primitive_scale is not computed here. Add if needed.
-
-    // --- Allocate Temporary Buffer for Backward Pass Internal Use ---
-    torch::Tensor tempBuffer = torch::empty({0}, options_byte.device(device));
-    std::function<char*(size_t)> tempFunc = resizeFunctional(tempBuffer);
-
-    // --- Create resizing functions for the SAVED forward state buffers ---
-    // These lambdas capture the tensors passed *in* from Python (geomBuffer, binningBuffer, imgBuffer)
-    // The integrator.backward call will use these to *read* the saved state.
-    // Pass const tensors to the lambda capture
-    const torch::Tensor& geomBufferConst = geomBuffer;
-    const torch::Tensor& binningBufferConst = binningBuffer;
-    const torch::Tensor& imgBufferConst = imgBuffer;
-    std::function<char*(size_t)> geomFunc = [&geomBufferConst](size_t N) {
-        // Backward only reads, so just return data_ptr. Size check might be useful.
-        // TORCH_CHECK(geomBufferConst.nbytes() >= N, "geomBuffer too small");
-        return reinterpret_cast<char*>(geomBufferConst.contiguous().data_ptr());
-    };
-     std::function<char*(size_t)> binningFunc = [&binningBufferConst](size_t N) {
-        // TORCH_CHECK(binningBufferConst.nbytes() >= N, "binningBuffer too small");
-        return reinterpret_cast<char*>(binningBufferConst.contiguous().data_ptr());
-    };
-     std::function<char*(size_t)> imgFunc = [&imgBufferConst](size_t N) {
-        // TORCH_CHECK(imgBufferConst.nbytes() >= N, "imgBuffer too small");
-        return reinterpret_cast<char*>(imgBufferConst.contiguous().data_ptr());
-    };
-
-
-    // <<< Instantiate the Integrator >>>
+    // 1. Instantiate Integrator
     CudaIntegrator::Integrator integrator;
 
-    // Get the current CUDA stream
+    // 2. Get CUDA stream
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
+    // 3. Prepare Output Gradient Tensors (Zero-initialized)
+    auto options_float = means3D.options().dtype(torch::kFloat32);
+    torch::Tensor dL_dmeans3D = torch::zeros_like(means3D, options_float);
+    torch::Tensor dL_dprimitive_confidences = torch::zeros_like(primitive_confidences, options_float); // Use flat input tensor shape
+    torch::Tensor dL_dfeature_table = torch::zeros_like(feature_table, options_float);
+    torch::Tensor dL_dlinear_weights = torch::zeros_like(linear_weights, options_float);
+    torch::Tensor dL_dlinear_bias = torch::zeros_like(linear_bias, options_float);
 
-    if (P > 0 && H > 0 && W > 0 && geomBuffer.numel() > 0) // Also check if buffers are non-empty
+    // 4. Create Buffer Accessor Lambdas
+    // Need mutable copies for the lambda capture if resizeFunctional modifies the tensor reference
+    auto geomBuffer_t_mut = geomBuffer_t;
+    auto binningBuffer_t_mut = binningBuffer_t;
+    auto imgBuffer_t_mut = imgBuffer_t;
+    auto geomBuffer = resizeFunctional(geomBuffer_t_mut);
+    auto binningBuffer = resizeFunctional(binningBuffer_t_mut);
+    auto imageBuffer = resizeFunctional(imgBuffer_t_mut);
+
+    // Get data pointers
+    const int* resolution_ptr = resolution_t.contiguous().data<int>();
+    const int* do_hash_ptr = do_hash.contiguous().data<int>();
+
+    // 5. Call the Integrator's backward method if needed
+    if (num_rendered > 0)
     {
-        // <<< Call backward using the instance >>>
         integrator.backward(
-            /* Buffer funcs */    geomFunc, binningFunc, imgFunc, tempFunc,
-            /* Primitive Count */ P,
-            /* Image Dim */       W, H,
-            /* Original Inputs*/  means3D.contiguous().data<float>(),
-                                  primitive_scale,
-                                  viewmatrix.contiguous().data<float>(),
-                                  projmatrix.contiguous().data<float>(),
-                                  cam_pos.contiguous().data<float>(),
-                                  near_plane, max_distance,
-                                  tan_fovx, tan_fovy,
-                                  primitive_confidences.contiguous().data<float>(), // X
-                                  feature_table.contiguous().data<float>(),         // Φ
-                                  resolution.contiguous().data<int>(),
-                                  do_hash.contiguous().data<int>(),
-                                  primes.contiguous().data<int>(),
-                                  feature_offset,
-                                  linear_weights.contiguous().data<float>(),
-                                  linear_bias.contiguous().data<float>(),
-                                  stencil_genus, grid_size, max_primitives_per_ray, occupancy_threshold,
-                                  bg_color.contiguous().data<float>(),
-            /* Fwd Pass Data */   nullptr, // forward_primitive_features_7D <<< Placeholder
-                                  nullptr, // forward_primitive_alphas      <<< Placeholder
-                                  nullptr, // forward_final_Ts              <<< Placeholder
-                                  nullptr, // forward_primitive_features_D  <<< Placeholder
-            /* Runtime Dims */    input_feature_dim, output_feature_dim, hashgrid_levels, num_output_channels,
-                                  feature_table_size, // Pass total size
-            /* Input Gradients*/  dL_dout_color.contiguous().data<float>(),
-                                  dL_dout_features.contiguous().data<float>(),
-            /* Output Gradients*/ dL_dmeans3D.contiguous().data<float>(),
-                                  dL_dprimitive_confidences.contiguous().data<float>(), // dL_dX
-                                  dL_dfeature_table.contiguous().data<float>(),         // dL_dΦ
-                                  dL_dlinear_weights.contiguous().data<float>(),
-                                  dL_dlinear_bias.contiguous().data<float>(),
-            /* Stream */          stream, // <<< Pass the stream
-            /* Misc */            debug
+            // <<< Pass the buffer lambdas >>>
+            geomBuffer,
+            binningBuffer,
+            imageBuffer,
+            // Primitive count & Dimensions
+            P,
+            num_rendered,
+            image_width, image_height,
+            // Input Data Pointers (matching forward pass)
+            means3D.contiguous().data<float>(),
+            primitive_scale,
+            viewmatrix.contiguous().data<float>(),
+            projmatrix.contiguous().data<float>(),
+            cam_pos.contiguous().data<float>(),
+            near_plane,
+            max_distance,
+            tan_fovx, tan_fovy,
+            primitive_confidences.contiguous().data<float>(),
+            feature_table.contiguous().data<float>(),
+            resolution_ptr,
+            do_hash_ptr,
+            primes.contiguous().data<int>(),
+            feature_offset,
+            linear_weights.contiguous().data<float>(),
+            linear_bias.contiguous().data<float>(),
+            stencil_genus,
+            grid_size,
+            max_primitives_per_ray,
+            occupancy_threshold,
+            bg_color.contiguous().data<float>(),
+            // Runtime Dimensions
+            input_feature_dim,
+            output_feature_dim,
+            hashgrid_levels,
+            num_output_channels,
+            feature_table_size,
+            // Input Gradients
+            dL_dout_color.contiguous().data<float>(),
+            dL_dout_features.contiguous().data<float>(),
+            // Output Gradients (to be computed)
+            dL_dmeans3D.data_ptr<float>(),
+            dL_dprimitive_confidences.data_ptr<float>(),
+            dL_dfeature_table.data_ptr<float>(),
+            dL_dlinear_weights.data_ptr<float>(),
+            dL_dlinear_bias.data_ptr<float>(),
+            // CUDA Stream & Debug Flag
+            stream,
+            debug
         );
     } else {
-         if (debug) std::cout << "Skipping CUDA backward: P=" << P << ", H=" << H << ", W=" << W << ", geomBuffer=" << geomBuffer.numel() << std::endl;
-         // Output gradients remain zero
+        if(debug) std::cout << "Skipping CUDA backward: num_rendered=0" << std::endl;
     }
 
-    // <<< Add explicit synchronization before returning >>>
-    if(debug)
-    {
-      // Sync stream before checking error
-      cudaError_t err = cudaStreamSynchronize(stream);
-      if (err != cudaSuccess) {
-            fprintf(stderr, "ERROR: Backward sync failed: %s\n", cudaGetErrorString(err));
-      }
-    }
-
-    // Return the computed gradients
-    return std::make_tuple(dL_dmeans3D, dL_dprimitive_confidences, dL_dfeature_table,
-                           dL_dlinear_weights, dL_dlinear_bias);
+    // 6. Return computed gradients
+    return std::make_tuple(
+        dL_dmeans3D,
+        dL_dprimitive_confidences, // Return the flat gradient tensor
+        dL_dfeature_table,
+        dL_dlinear_weights,
+        dL_dlinear_bias
+    );
 }
 
 

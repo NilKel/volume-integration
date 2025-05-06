@@ -12,7 +12,9 @@
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 import os
-base_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Add '-G' to NVCC flags
+os.environ['NVCC_APPEND_FLAGS'] = '-G' # Or modify existing flags
 
 setup(
     name="volume_integration",
@@ -30,12 +32,12 @@ setup(
                 "cuda_integrator/backward.cu"
             ],
             include_dirs=[
-                os.path.join(base_dir, "cuda_integrator"),
-                os.path.join(base_dir, "third_party/glm")
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda_integrator"),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "third_party/glm")
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
-                "nvcc": ["-O3", "-std=c++17", "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__", "-U__CUDA_NO_HALF2_OPERATORS__"]
+                "nvcc": ["-O3", "-std=c++17", "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__", "-U__CUDA_NO_HALF2_OPERATORS__", "-Xcompiler", "-fPIC", "-G", "-lineinfo"]
             }
         )
     ],

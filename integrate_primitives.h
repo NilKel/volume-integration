@@ -62,19 +62,20 @@ IntegratePrimitivesCUDA(
 
 // Backward pass function declaration for PyTorch binding
 // Returns gradients w.r.t.: means3D, primitive_confidences, feature_table, linear_weights, linear_bias
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor
+>
 IntegratePrimitivesBackwardCUDA(
     // --- Input Gradients (from Python) ---
-    const torch::Tensor& dL_dout_color,         // (H, W, 3) or (3, H, W)
-    const torch::Tensor& dL_dout_features,      // (H, W, F_out) or (F_out, H, W)
+    const torch::Tensor& dL_dout_color,
+    const torch::Tensor& dL_dout_features,
     // --- Saved Forward Pass Data (from Python ctx) ---
-    // State Buffers
-    const torch::Tensor& geomBuffer,            // Saved geometry state buffer
-    const torch::Tensor& binningBuffer,         // Saved binning state buffer
-    const torch::Tensor& imgBuffer,             // Saved image state buffer
-    // Original Inputs
+    const torch::Tensor& geomBuffer,
+    const torch::Tensor& binningBuffer,
+    const torch::Tensor& imgBuffer,
+    // Original Inputs needed for backward
 	const torch::Tensor& means3D,
-	const torch::Tensor& primitive_confidences, // Flat (P, G^3)
+	const torch::Tensor& primitive_confidences,
 	const float primitive_scale,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
@@ -102,7 +103,10 @@ IntegratePrimitivesBackwardCUDA(
 	const uint32_t output_feature_dim,
 	const uint32_t hashgrid_levels,
 	const uint32_t num_output_channels,
-    const uint32_t feature_table_size, // Total elements in feature_table (T*L*F)
+    const uint32_t feature_table_size,
+    // --- Other Saved Context ---
+    const int P,
+    const int num_rendered,
 	// Misc
 	const bool debug
 );

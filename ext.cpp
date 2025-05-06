@@ -16,6 +16,6 @@
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // Updated function names and pointers
   m.def("integrate_primitives", &IntegratePrimitivesCUDA, "Integrate Primitives CUDA forward");
-  // m.def("integrate_primitives_backward", &IntegratePrimitivesBackwardCUDA, "Integrate Primitives CUDA backward");
+  m.def("integrate_primitives_backward", &IntegratePrimitivesBackwardCUDA, "Integrate Primitives CUDA backward");
   m.def("mark_visible", &markVisible, "Mark Visible Primitives CUDA");
 }
