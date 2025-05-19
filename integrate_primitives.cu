@@ -9,8 +9,23 @@
  * For inquiries contact  george.drettakis@inria.fr
  */
 
+// <<< MOVED AND MODIFIED: Attempt to resolve CUB conflicts >>>
+// Undefine potential conflicting macros FIRST
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
+// <<< END MOVED AND MODIFIED SECTION >>>
+
+// <<< MODIFIED ORDER: Include CUB before torch/extension.h >>>
+#include <cub/cub.cuh>
+#include <cub/device/device_reduce.cuh>
+// <<< END MODIFIED ORDER >>>
+
 #include <math.h>
-#include <torch/extension.h>
+#include <torch/extension.h> // Major include, potentially brings in conflicting macros
 #include <cstdio>
 #include <sstream>
 #include <iostream>
@@ -19,11 +34,12 @@
 #include <cuda_runtime_api.h>
 #include <memory>
 #include "cuda_integrator/config.h"
-#include "cuda_integrator/integrator.h"
+#include "cuda_integrator/integrator.h" // This should make CudaIntegrator::ImageState visible
 #include <fstream>
 #include <string>
 #include <functional>
 #include "integrate_primitives.h"
+#include "integrator_impl.h"
 #include <c10/cuda/CUDAStream.h>
 
 // Define constants for block dimensions if not defined elsewhere
@@ -37,18 +53,16 @@
 // Helper function to create resizing lambdas for buffers allocated on GPU
 std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     auto lambda = [&t](size_t N) {
-        // Resize the tensor to the requested byte size N
-        // Note: Tensor size is in number of elements, so divide N by element size if needed.
-        // Assuming the buffer will store bytes, resize to N directly.
-        // Ensure the tensor has at least N bytes capacity.
-        // If N is 0, resize to 0 elements.
         if (N == 0) {
-             t.resize_({0});
+            // Backward pass: retrieve pointer to existing buffer without resizing.
+            // Ensure tensor is contiguous. data_ptr() might be null if tensor was empty.
+            return reinterpret_cast<char*>(t.contiguous().data_ptr());
         } else {
-             // Resize based on bytes. Assuming dtype is uint8 (byte).
-             t.resize_({(long long)N});
+            // Forward pass: resize the tensor to N bytes and return its data pointer.
+            // Assuming the buffer will store bytes, resize to N directly.
+            t.resize_({(long long)N});
+            return reinterpret_cast<char*>(t.contiguous().data_ptr());
         }
-		return reinterpret_cast<char*>(t.contiguous().data_ptr());
     };
     return lambda;
 }
@@ -174,11 +188,99 @@ IntegratePrimitivesCUDA(
       imgBuffer.resize_({0});
   }
 
-  // <<< Add explicit synchronization before returning >>>
-  if(debug)
-  {
-    cudaDeviceSynchronize();
+  // <<< ADDED: CUB Reduction for num_contrib_per_pixel AFTER forward pass >>>
+  if (debug && P > 0 && H > 0 && W > 0 && imgBuffer.numel() > 0) {
+      cudaError_t err_sync = cudaDeviceSynchronize(); // Ensure forward kernel is done writing to imgBuffer
+      if (err_sync != cudaSuccess) {
+          fprintf(stderr, "[Forward Check] CUDA error after forward sync: %s\n", cudaGetErrorString(err_sync));
+      }
+
+      const int num_pixels = W * H;
+      // Note: tile_grid calculation here is for checking ImageState::required,
+      // it's not directly used for CUB reduction over num_pixels.
+      const dim3 tile_grid_check((W + BLOCK_X - 1) / BLOCK_X, (H + BLOCK_Y - 1) / BLOCK_Y, 1);
+      const int num_tiles_check = tile_grid_check.x * tile_grid_check.y;
+
+      // Get the current CUDA stream from PyTorch
+      cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+
+      // Check if ImageState can be reconstructed
+      // This relies on CudaIntegrator::ImageState being defined and visible
+      // (should come from cuda_integrator/integrator.h -> common_types.h)
+      size_t img_chunk_size_check = CudaIntegrator::ImageState::required(num_tiles_check, num_pixels, max_primitives_per_ray);
+
+      if (imgBuffer.nbytes() >= img_chunk_size_check) {
+          // <<< MODIFIED: Store pointer in an lvalue before passing to fromChunk >>>
+          char* imgBuffer_ptr = reinterpret_cast<char*>(imgBuffer.contiguous().data_ptr());
+          CudaIntegrator::ImageState imgStateCheck = CudaIntegrator::ImageState::fromChunk(
+              imgBuffer_ptr, // Pass the lvalue
+              num_tiles_check, // Use the num_tiles calculated for this check
+              num_pixels,
+              max_primitives_per_ray
+          );
+          // <<< END MODIFICATION >>>
+
+          if (imgStateCheck.num_contrib_per_pixel != nullptr) {
+              // Allocate device memory for sum and max results
+              int* d_sum_contrib = nullptr;
+              int* d_max_contrib = nullptr;
+              cudaError_t err_alloc_sum = cudaMallocAsync(&d_sum_contrib, sizeof(int), stream);
+              cudaError_t err_alloc_max = cudaMallocAsync(&d_max_contrib, sizeof(int), stream);
+
+              if (err_alloc_sum != cudaSuccess || err_alloc_max != cudaSuccess) {
+                  fprintf(stderr, "[Forward Check] CUDA error allocating memory for reduction results: SumErr=%s, MaxErr=%s\n", cudaGetErrorString(err_alloc_sum), cudaGetErrorString(err_alloc_max));
+              } else {
+                  // Allocate temporary storage for CUB reduction
+                  void* d_temp_storage_sum = nullptr;
+                  size_t temp_storage_bytes_sum = 0;
+                  cub::DeviceReduce::Sum(d_temp_storage_sum, temp_storage_bytes_sum, imgStateCheck.num_contrib_per_pixel, d_sum_contrib, num_pixels, stream);
+                  cudaError_t err_alloc_temp_sum = cudaMallocAsync(&d_temp_storage_sum, temp_storage_bytes_sum, stream);
+                  
+                  void* d_temp_storage_max = nullptr;
+                  size_t temp_storage_bytes_max = 0;
+                  cub::DeviceReduce::Max(d_temp_storage_max, temp_storage_bytes_max, imgStateCheck.num_contrib_per_pixel, d_max_contrib, num_pixels, stream);
+                  cudaError_t err_alloc_temp_max = cudaMallocAsync(&d_temp_storage_max, temp_storage_bytes_max, stream);
+
+                  if (err_alloc_temp_sum != cudaSuccess || err_alloc_temp_max != cudaSuccess) {
+                       fprintf(stderr, "[Forward Check] CUDA error allocating temp storage for reduction: SumErr=%s, MaxErr=%s\n", cudaGetErrorString(err_alloc_temp_sum), cudaGetErrorString(err_alloc_temp_max));
+                  } else {
+                      cub::DeviceReduce::Sum(d_temp_storage_sum, temp_storage_bytes_sum, imgStateCheck.num_contrib_per_pixel, d_sum_contrib, num_pixels, stream);
+                      cub::DeviceReduce::Max(d_temp_storage_max, temp_storage_bytes_max, imgStateCheck.num_contrib_per_pixel, d_max_contrib, num_pixels, stream);
+
+                      // Copy results to host
+                      int h_sum_contrib = 0;
+                      int h_max_contrib = 0;
+                      cudaMemcpyAsync(&h_sum_contrib, d_sum_contrib, sizeof(int), cudaMemcpyDeviceToHost, stream);
+                      cudaMemcpyAsync(&h_max_contrib, d_max_contrib, sizeof(int), cudaMemcpyDeviceToHost, stream);
+                      cudaStreamSynchronize(stream); // Wait for all operations on the stream
+
+                      printf("[Forward Check] num_contrib_per_pixel: SUM = %d, MAX = %d (over %d pixels)\n",
+                             h_sum_contrib, h_max_contrib, num_pixels);
+                      fflush(stdout);
+
+                      // Free temporary device memory
+                      cudaFreeAsync(d_temp_storage_sum, stream);
+                      cudaFreeAsync(d_temp_storage_max, stream);
+                  }
+                  cudaFreeAsync(d_sum_contrib, stream);
+                  cudaFreeAsync(d_max_contrib, stream);
+              }
+          } else {
+              printf("[Forward Check] imgStateCheck.num_contrib_per_pixel is NULL.\n");
+              fflush(stdout);
+          }
+      } else {
+           printf("[Forward Check] Warning: imgBuffer size (%lld bytes) is smaller than expected (%zu bytes for %d tiles, %d pixels, %d max_primitives_per_ray). Cannot check num_contrib stats.\n",
+                  (long long)imgBuffer.nbytes(), img_chunk_size_check, num_tiles_check, num_pixels, max_primitives_per_ray);
+           fflush(stdout);
+      }
+  } else if(debug) { // General sync if debug is on but conditions for CUB reduction aren't met
+    cudaError_t err_sync = cudaDeviceSynchronize();
+    if (err_sync != cudaSuccess) {
+        fprintf(stderr, "[Forward Check] CUDA error after generic forward debug sync: %s\n", cudaGetErrorString(err_sync));
+    }
   }
+  // <<< END CUB REDUCTION >>>
 
   // Return final outputs and the state buffers needed for backward
   return std::make_tuple(num_rendered, out_color, out_features, visibility_info, geomBuffer, binningBuffer, imgBuffer);
@@ -254,9 +356,9 @@ IntegratePrimitivesBackwardCUDA(
     auto geomBuffer_t_mut = geomBuffer_t;
     auto binningBuffer_t_mut = binningBuffer_t;
     auto imgBuffer_t_mut = imgBuffer_t;
-    auto geomBuffer = resizeFunctional(geomBuffer_t_mut);
-    auto binningBuffer = resizeFunctional(binningBuffer_t_mut);
-    auto imageBuffer = resizeFunctional(imgBuffer_t_mut);
+    std::function<char*(size_t)> geomBuffer = resizeFunctional(geomBuffer_t_mut);
+    std::function<char*(size_t)> binningBuffer = resizeFunctional(binningBuffer_t_mut);
+    std::function<char*(size_t)> imageBuffer = resizeFunctional(imgBuffer_t_mut);
 
     // Get data pointers
     const int* resolution_ptr = resolution_t.contiguous().data<int>();

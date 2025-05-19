@@ -9,6 +9,15 @@
  * For inquiries contact  george.drettakis@inria.fr
  */
 
+// <<< ADDED: Attempt to resolve CUB conflicts >>>
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
+// <<< END ADDED SECTION >>>
+
 #include "integrator_impl.h"
 #include <iostream>
 #include <fstream>
@@ -20,6 +29,7 @@
 #include <cub/cub.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
+#include <cub/device/device_reduce.cuh>
 #define GLM_FORCE_CUDA
 #include <glm/glm.hpp>
 
@@ -98,8 +108,8 @@ __global__ void duplicateWithKeys(
 	const float2* points_xy,
 	const float* depths,
 	const uint32_t* offsets,
-	uint64_t* primitive_keys_unsorted,
-	uint32_t* primitive_values_unsorted,
+	uint64_t* gaussian_keys_unsorted,
+	uint32_t* gaussian_values_unsorted,
 	int* radii,
 	dim3 grid)
 {
@@ -107,20 +117,20 @@ __global__ void duplicateWithKeys(
 	if (idx >= P)
 		return;
 
-	// Generate no key/value pair for invisible primitives (radii <= 0)
+	// Generate no key/value pair for invisible Gaussians
 	if (radii[idx] > 0)
 	{
-		// Find this primitive's offset in buffer for writing keys/values.
+		// Find this Gaussian's offset in buffer for writing keys/values.
 		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
 		uint2 rect_min, rect_max;
 
 		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
 
-		// For each tile that the bounding rect overlaps, emit a
+		// For each tile that the bounding rect overlaps, emit a 
 		// key/value pair. The key is |  tile ID  |      depth      |,
-		// and the value is the ID of the primitive. Sorting the values
-		// with this key yields primitive IDs in a list, such that they
-		// are first sorted by tile and then by depth.
+		// and the value is the ID of the Gaussian. Sorting the values 
+		// with this key yields Gaussian IDs in a list, such that they
+		// are first sorted by tile and then by depth. 
 		for (int y = rect_min.y; y < rect_max.y; y++)
 		{
 			for (int x = rect_min.x; x < rect_max.x; x++)
@@ -128,8 +138,8 @@ __global__ void duplicateWithKeys(
 				uint64_t key = y * grid.x + x;
 				key <<= 32;
 				key |= *((uint32_t*)&depths[idx]);
-				primitive_keys_unsorted[off] = key;
-				primitive_values_unsorted[off] = idx;
+				gaussian_keys_unsorted[off] = key;
+				gaussian_values_unsorted[off] = idx;
 				off++;
 			}
 		}
@@ -145,33 +155,22 @@ __global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* rang
 	if (idx >= L)
 		return;
 
+	// Read tile ID from key. Update start/end of tile range if at limit.
 	uint64_t key = point_list_keys[idx];
-	uint32_t tile_id = key >> 32;
-
+	uint32_t currtile = key >> 32;
 	if (idx == 0)
-	{
-		// First element starts the first tile range.
-		ranges[tile_id].x = 0;
-	}
+		ranges[currtile].x = 0;
 	else
 	{
-		// If the tile ID differs from the previous element's,
-		// then the previous element was the end of its tile range,
-		// and the current element is the start of the next range.
-		uint64_t prev_key = point_list_keys[idx - 1];
-		uint32_t prev_tile_id = prev_key >> 32;
-		if (tile_id != prev_tile_id)
+		uint32_t prevtile = point_list_keys[idx - 1] >> 32;
+		if (currtile != prevtile)
 		{
-			ranges[prev_tile_id].y = idx;
-			ranges[tile_id].x = idx;
+			ranges[prevtile].y = idx;
+			ranges[currtile].x = idx;
 		}
 	}
-
 	if (idx == L - 1)
-	{
-		// Last element ends the last tile range.
-		ranges[tile_id].y = L;
-	}
+		ranges[currtile].y = L;
 }
 
 // Mark primitives as visible/invisible, based on view frustum testing
@@ -257,7 +256,9 @@ int CudaIntegrator::Integrator::forward(
 	// --- Allocate Buffers ---
 	// Geometry buffer
 	size_t geom_chunk_size = GeometryState::required(P); // Use static method
+
 	char* geom_chunkptr = geometryBuffer(geom_chunk_size);
+
 	GeometryState geomState = GeometryState::fromChunk(geom_chunkptr, P);
 
 	// Image buffer <<< Uses updated fromChunk >>>
@@ -283,8 +284,9 @@ int CudaIntegrator::Integrator::forward(
 		primitive_scale,
 		viewmatrix, projmatrix,
 		width, height,
-		focal_x, focal_y,
 		tan_fovx, tan_fovy,
+		focal_x, focal_y,
+		
 		radii,                 // Use the potentially overridden radii
 		geomState.means2D,
 		geomState.depths,
@@ -369,6 +371,17 @@ int CudaIntegrator::Integrator::forward(
 		imgState.ranges);             // Output tile ranges
 	CHECK_CUDA(, debug);
 	printf("[Integrator::forward] Completed identifyTileRanges kernel.\n"); fflush(stdout);
+
+    // >>> ADD THIS SYNCHRONIZATION <<<
+    cudaDeviceSynchronize(); 
+    // cudaError_t sync_err = cudaGetLastError(); // Optional: Check for errors after sync
+    // if (sync_err != cudaSuccess) {
+    //    fprintf(stderr, "CUDA error after cudaDeviceSynchronize: %s\n", cudaGetErrorString(sync_err));
+    // }
+    // fflush(stdout); // Ensure prints appear before potential crashes if any
+
+    printf("[Integrator::forward] Completed identifyTileRanges kernel AND SYNCED GPU.\n"); // Modified/New log
+    fflush(stdout);
 
 
 	// --- 6. Initialize Pixel Indices Buffer ---
@@ -506,42 +519,147 @@ void CudaIntegrator::Integrator::backward(
 	bool debug
 )
 {
-	if (debug) printf("[Integrator::backward] Starting backward pass...\n"); fflush(stdout);
+	if (debug) {
+        printf("[Integrator::backward] Received Params: P=%d, num_rendered=%d, W=%d, H=%d, max_primitives_per_ray=%d\n",
+               P, num_rendered, width, height, max_primitives_per_ray);
+        fflush(stdout);
+	}
+	if (debug) printf("[Integrator::backward] Entered Integrator::backward.\n"); fflush(stdout);
+	if (num_rendered == 0 && debug) {
+		printf("[Integrator::backward] num_rendered is 0, skipping backward pass logic.\n"); fflush(stdout);
+		// Still need to zero out gradients if they were allocated by the caller
+        // The PyTorch binding zeros them, so this might not be strictly necessary here,
+        // but good practice if this function could be called from elsewhere.
+        cudaMemsetAsync(dL_dmeans3D, 0, (size_t)P * 3 * sizeof(float), stream);
+        const int grid_volume_bw = grid_size * grid_size * grid_size; // Corrected variable name
+        cudaMemsetAsync(dL_dprimitive_confidences, 0, (size_t)P * grid_volume_bw * sizeof(float), stream);
+        cudaMemsetAsync(dL_dfeature_table, 0, (size_t)feature_table_size * sizeof(float), stream); // feature_table_size is uint64_t
+        const uint32_t input_linear_dim_bw = input_feature_dim * hashgrid_levels;
+        const uint32_t output_linear_dim_bw = num_output_channels + output_feature_dim + 1; // Matches kernel's output_linear_dim
+        cudaMemsetAsync(dL_dlinear_weights, 0, (size_t)input_linear_dim_bw * output_linear_dim_bw * sizeof(float), stream);
+        cudaMemsetAsync(dL_dlinear_bias, 0, (size_t)output_linear_dim_bw * sizeof(float), stream);
+		return;
+	}
 
-	// --- 1. Calculate Derived Dimensions ---
-	const uint32_t grid_volume = (uint32_t)grid_size * grid_size * grid_size;
-	const uint32_t input_linear_dim = input_feature_dim * hashgrid_levels;
-	const uint32_t output_linear_dim = num_output_channels + output_feature_dim + 1; // +1 for density
+	// Calculate grid_volume for confidence gradients
+	const int grid_volume = grid_size * grid_size * grid_size;
+	const int input_linear_dim = input_feature_dim * hashgrid_levels;
+	const int output_linear_dim = num_output_channels;
+
+
+	// --- 1. Check for Empty Input ---
+	if (P == 0 || width == 0 || height == 0) {
+		if (debug) printf("[Integrator::backward] Skipping backward due to P=0 or W=0 or H=0.\n"); fflush(stdout);
+		// Ensure gradient buffers are zeroed if they were to be accumulated into
+		// (already done by PyTorch or explicit zeroing before calling this function)
+		return;
+	}
+	if (num_rendered == 0 && stencil_genus > 0) { // stencil_genus > 0 implies rendering happened
+		if (debug) printf("[Integrator::backward] Skipping backward as num_rendered is 0 but stencil_genus > 0 (no actual rendering occurred).\n"); fflush(stdout);
+		return;
+	}
+
 
 	// --- 2. Zero Initialize Final Output Gradient Buffers ---
 	// It's crucial these are zero before the kernel launch, as it uses atomicAdds.
-	// Note: dL_dmeans3D is zeroed but not computed by compute_gradients yet.
 	cudaMemsetAsync(dL_dmeans3D, 0, (size_t)P * 3 * sizeof(float), stream);
 	cudaMemsetAsync(dL_dprimitive_confidences, 0, (size_t)P * grid_volume * sizeof(float), stream);
-	// <<< Corrected size calculation for feature table gradient >>>
-	// Total size is L*T*F, which is feature_table_size * input_feature_dim
-	// However, the kernel expects feature_table_size to be the total number of floats (L*T*F)
-	// So, the size passed to cudaMemsetAsync should just be feature_table_size * sizeof(float)
-	// Ensure feature_table_size passed from Python/caller is indeed L*T*F.
 	cudaMemsetAsync(dL_dfeature_table, 0, (size_t)feature_table_size * sizeof(float), stream);
 	cudaMemsetAsync(dL_dlinear_weights, 0, (size_t)input_linear_dim * output_linear_dim * sizeof(float), stream);
 	cudaMemsetAsync(dL_dlinear_bias, 0, (size_t)output_linear_dim * sizeof(float), stream);
+	if (debug) printf("[Integrator::backward] Reached this point...\n"); fflush(stdout);
 
 	// --- 3. Retrieve State from Forward Pass Buffers ---
-	// Get pointers to the state saved during forward pass.
-	char* geomChunk = geomBuffer(0);
-	GeometryState geomState = GeometryState::fromChunk(geomChunk, P);
+	char* geom_chunkptr = geomBuffer(0);
+	// <<< ADD NULL CHECK FOR geom_chunkptr >>>
+	if (geom_chunkptr == nullptr) {
+		printf("[Integrator::backward] FATAL: geom_chunkptr is NULL after geomBuffer(0) call!\n"); fflush(stdout);
+	} else if (debug) {
+		printf("[Integrator::backward] geom_chunkptr: %p\n", (void*)geom_chunkptr); fflush(stdout);
+	}
+	// <<< END NULL CHECK >>>
+	GeometryState geomState = GeometryState::fromChunk(geom_chunkptr, P);
 
 	char* binningChunk = binningBuffer(0);
+	// <<< ADD NULL CHECK FOR binningChunk >>>
+	if (binningChunk == nullptr) {
+		printf("[Integrator::backward] FATAL: binningChunk is NULL after binningBuffer(0) call!\n"); fflush(stdout);
+	} else if (debug) {
+		printf("[Integrator::backward] binningChunk: %p\n", (void*)binningChunk); fflush(stdout);
+	}
+	// <<< END NULL CHECK >>>
 	BinningState binningState = BinningState::fromChunk(binningChunk, num_rendered);
 
 	char* imageChunk = imageBuffer(0);
+	// <<< ADD NULL CHECK FOR imageChunk >>>
+	if (imageChunk == nullptr) {
+		printf("[Integrator::backward] FATAL: imageChunk is NULL after imageBuffer(0) call!\n"); fflush(stdout);
+		// If this happens, ImageState::fromChunk will use a null base pointer, leading to crashes.
+		// Consider returning or throwing to prevent further execution.
+	} else if (debug) {
+		printf("[Integrator::backward] imageChunk: %p\n", (void*)imageChunk); fflush(stdout);
+	}
+	// <<< END NULL CHECK >>>
 	const int num_pixels = width * height;
 	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 	const int num_tiles = tile_grid.x * tile_grid.y;
+	// <<< PRINT PARAMS FOR ImageState::fromChunk >>>
+	if (debug) {
+		printf("[Integrator::backward] ImageState::fromChunk params: num_tiles=%d, num_pixels=%d, max_primitives_per_ray=%d\n",
+			   num_tiles, num_pixels, max_primitives_per_ray);
+		fflush(stdout);
+	}
+	// <<< END PRINT PARAMS >>>
 	ImageState imageState = ImageState::fromChunk(imageChunk, num_tiles, num_pixels, max_primitives_per_ray);
 
 	if (debug) printf("[Integrator::backward] Retrieved state from buffers.\n"); fflush(stdout);
+
+    // <<< ADDED: CUB Reduction for num_contrib_per_pixel in backward >>>
+    if (debug && P > 0 && height > 0 && width > 0 && imageState.num_contrib_per_pixel != nullptr) {
+        // Allocate device memory for sum and max results
+        int* d_sum_contrib_bw = nullptr;
+        int* d_max_contrib_bw = nullptr;
+        cudaMallocAsync(&d_sum_contrib_bw, sizeof(int), stream);
+        cudaMallocAsync(&d_max_contrib_bw, sizeof(int), stream);
+
+        // Allocate temporary storage for CUB reduction
+        void* d_temp_storage_sum_bw = nullptr;
+        size_t temp_storage_bytes_sum_bw = 0;
+        cub::DeviceReduce::Sum(d_temp_storage_sum_bw, temp_storage_bytes_sum_bw, imageState.num_contrib_per_pixel, d_sum_contrib_bw, num_pixels, stream);
+        cudaMallocAsync(&d_temp_storage_sum_bw, temp_storage_bytes_sum_bw, stream);
+        cub::DeviceReduce::Sum(d_temp_storage_sum_bw, temp_storage_bytes_sum_bw, imageState.num_contrib_per_pixel, d_sum_contrib_bw, num_pixels, stream);
+
+        void* d_temp_storage_max_bw = nullptr;
+        size_t temp_storage_bytes_max_bw = 0;
+        cub::DeviceReduce::Max(d_temp_storage_max_bw, temp_storage_bytes_max_bw, imageState.num_contrib_per_pixel, d_max_contrib_bw, num_pixels, stream);
+        cudaMallocAsync(&d_temp_storage_max_bw, temp_storage_bytes_max_bw, stream);
+        cub::DeviceReduce::Max(d_temp_storage_max_bw, temp_storage_bytes_max_bw, imageState.num_contrib_per_pixel, d_max_contrib_bw, num_pixels, stream);
+
+        // Copy results to host
+        int h_sum_contrib_bw = 0;
+        int h_max_contrib_bw = 0;
+        cudaMemcpyAsync(&h_sum_contrib_bw, d_sum_contrib_bw, sizeof(int), cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(&h_max_contrib_bw, d_max_contrib_bw, sizeof(int), cudaMemcpyDeviceToHost, stream);
+        
+        // Synchronize stream before printing, but after launching the main backward kernel if possible.
+        // For this debug print, we'll sync here.
+        cudaStreamSynchronize(stream);
+
+
+        printf("[Backward Check] Loaded num_contrib_per_pixel: SUM = %d, MAX = %d (over %d pixels)\n",
+               h_sum_contrib_bw, h_max_contrib_bw, num_pixels);
+        fflush(stdout);
+
+        // Free temporary device memory
+        cudaFreeAsync(d_temp_storage_sum_bw, stream);
+        cudaFreeAsync(d_temp_storage_max_bw, stream);
+        cudaFreeAsync(d_sum_contrib_bw, stream);
+        cudaFreeAsync(d_max_contrib_bw, stream);
+    } else if (debug && imageState.num_contrib_per_pixel == nullptr) {
+        printf("[Backward Check] imageState.num_contrib_per_pixel is NULL.\n");
+        fflush(stdout);
+    }
+    // <<< END ADDED CUB REDUCTION >>>
 
 	// --- 4. Execute Unified Backward Kernel ---
 	// This single kernel computes gradients for confidences, features, weights, bias.
@@ -552,6 +670,7 @@ void CudaIntegrator::Integrator::backward(
 
 	BACKWARD::compute_gradients(
 		backward_grid, backward_block,
+		imageState.ranges,
 		// Input Gradients
 		dL_dout_color, dL_dout_features,
 		// Forward State

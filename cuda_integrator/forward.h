@@ -29,19 +29,19 @@
 #define BLOCK_Y 16
 #endif
 
-// <<< Define MAX constants if not defined elsewhere >>>
-#ifndef MAX_GRID_VOLUME
-#define MAX_GRID_VOLUME (10*10*10) // Example: Max 10x10x10 grid
-#endif
-#ifndef MAX_STENCIL_SIZE
-#define MAX_STENCIL_SIZE 27 // Example: Max 3x3x3 stencil
-#endif
-#ifndef MAX_INPUT_LINEAR_DIM
-#define MAX_INPUT_LINEAR_DIM 64 // Example
-#endif
-#ifndef MAX_OUTPUT_LINEAR_DIM
-#define MAX_OUTPUT_LINEAR_DIM 16 // Example (e.g., 3 color + 12 feature + 1 density)
-#endif
+// // <<< Define MAX constants if not defined elsewhere >>>
+// #ifndef MAX_GRID_VOLUME
+// #define MAX_GRID_VOLUME (10*10*10) // Example: Max 10x10x10 grid
+// #endif
+// #ifndef MAX_STENCIL_SIZE
+// #define MAX_STENCIL_SIZE 27 // Example: Max 3x3x3 stencil
+// #endif
+// #ifndef MAX_INPUT_LINEAR_DIM
+// #define MAX_INPUT_LINEAR_DIM 64 // Example
+// #endif
+// #ifndef MAX_OUTPUT_LINEAR_DIM
+// #define MAX_OUTPUT_LINEAR_DIM 16 // Example (e.g., 3 color + 12 feature + 1 density)
+// #endif
 
 namespace FORWARD
 {
@@ -57,8 +57,8 @@ namespace FORWARD
 		const float* viewmatrix,
 		const float* projmatrix,
 		const int W, int H,
-		const float focal_x, float focal_y,
 		const float tan_fovx, float tan_fovy,
+		const float focal_x, float focal_y,
 		int* radii, // Output: Screen-space radius
 		float2* means2D, // Output: Projected 2D center
 		float* depths, // Output: View-space depth

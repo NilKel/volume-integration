@@ -22,6 +22,7 @@ namespace BACKWARD {
     void compute_gradients( // Renamed from 'render' for clarity
         // <<< Kernel Launch Config >>>
         const dim3 grid, dim3 block,
+        const uint2* ranges,
         // --- Input Gradients (Pixel-based) ---
         const float* dL_dOut_Color,    // (CHANNELS, H, W)
         const float* dL_dOut_Features, // (output_feature_dim, H, W) - Optional

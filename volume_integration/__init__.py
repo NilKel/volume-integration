@@ -75,6 +75,15 @@ class _IntegratePrimitives(Function):
         # --- Other inputs (packed in settings) ---
         integration_settings,
     ):
+        # <<< ADD DEBUG PRINTS HERE >>>
+        print(f"\n[PyTorch _IntegratePrimitives.forward] Input requires_grad check:")
+        print(f"  means3D.requires_grad: {means3D.requires_grad} (shape: {means3D.shape})")
+        print(f"  primitive_confidences.requires_grad: {primitive_confidences.requires_grad} (shape: {primitive_confidences.shape})")
+        print(f"  feature_table.requires_grad: {feature_table.requires_grad} (shape: {feature_table.shape})")
+        print(f"  linear_weights.requires_grad: {linear_weights.requires_grad} (shape: {linear_weights.shape})")
+        print(f"  linear_bias.requires_grad: {linear_bias.requires_grad} (shape: {linear_bias.shape})")
+        # <<< END DEBUG PRINTS >>>
+
         # Ensure inputs are contiguous and correct type
         means3D = means3D.contiguous().float()
         primitive_confidences = primitive_confidences.contiguous().float()
@@ -180,6 +189,13 @@ class _IntegratePrimitives(Function):
         num_rendered, out_color, out_features, visibility_info, \
         geomBuffer, binningBuffer, imgBuffer = cuda_integrator.integrate_primitives(*args)
 
+        # <<< ADD GRAD_FN CHECK HERE >>>
+        print(f"\n[PyTorch Forward] grad_fn check AFTER C++ call (before returning from _IntegratePrimitives.forward):")
+        print(f"  out_color.grad_fn: {out_color.grad_fn}")
+        print(f"  out_features.grad_fn: {out_features.grad_fn}")
+        print(f"  visibility_info.grad_fn: {visibility_info.grad_fn}")
+        # <<< END GRAD_FN CHECK >>>
+
         # --- Save tensors and context for backward pass ---
         ctx.save_for_backward(
             # Original Inputs needed for backward
@@ -194,7 +210,10 @@ class _IntegratePrimitives(Function):
         ctx.num_rendered = num_rendered # Store this potentially useful info
         ctx.original_confidences_shape = original_confidences_shape # Store shape for grad reshaping
 
-        # Return the rendered outputs relevant to the graph
+        # <<< DEBUG: Confirm save_for_backward called >>>
+        print("[PyTorch Forward] Called ctx.save_for_backward.")
+        # <<< END DEBUG >>>
+        
         return out_color, out_features, visibility_info
 
     @staticmethod
@@ -209,6 +228,17 @@ class _IntegratePrimitives(Function):
         original_confidences_shape = ctx.original_confidences_shape
         num_rendered = ctx.num_rendered
         P = means3D.shape[0]
+
+        # <<< ADD CTX.NEEDS_INPUT_GRAD CHECK >>>
+        print(f"\n[PyTorch Backward] ctx.needs_input_grad: {ctx.needs_input_grad}")
+        # Indices correspond to inputs of _IntegratePrimitives.forward:
+        # 0: means3D
+        # 1: primitive_confidences
+        # 2: feature_table
+        # 3: linear_weights
+        # 4: linear_bias
+        # 5: integration_settings
+        # <<< END CTX.NEEDS_INPUT_GRAD CHECK >>>
 
         # Check which inputs require gradients
         needs_means3D_grad = ctx.needs_input_grad[0]

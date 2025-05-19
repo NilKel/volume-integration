@@ -62,9 +62,8 @@ namespace CudaIntegrator
 			obtain(chunk, state.internal_radii, P, 128);
 			obtain(chunk, state.means2D, P, 128);
 			obtain(chunk, state.tiles_touched, P, 128);
-			size_t scan_bytes;
-			cub::DeviceScan::InclusiveSum(nullptr, scan_bytes, (uint32_t*)nullptr, (uint32_t*)nullptr, P);
-			obtain(chunk, state.scanning_space, scan_bytes, 128);
+			cub::DeviceScan::InclusiveSum(nullptr, state.scan_size, state.tiles_touched, state.tiles_touched, P);
+			obtain(chunk, state.scanning_space, state.scan_size, 128);
 			obtain(chunk, state.point_offsets, P, 128); return state;
 		}
 	};
@@ -128,8 +127,11 @@ namespace CudaIntegrator
 			obtain(chunk, state.point_list_keys, P_prime, 128);
 			obtain(chunk, state.point_list, P_prime, 128);
 			size_t sort_bytes;
-			cub::DeviceRadixSort::SortPairs(nullptr, sort_bytes, (uint64_t*)nullptr, (uint64_t*)nullptr, (uint32_t*)nullptr, (uint32_t*)nullptr, P_prime);
-			obtain(chunk, state.list_sorting_space, sort_bytes, 128);
+			cub::DeviceRadixSort::SortPairs(
+				nullptr, state.sorting_size,
+				state.point_list_keys_unsorted, state.point_list_keys,
+				state.point_list_unsorted, state.point_list, P_prime);
+			obtain(chunk, state.list_sorting_space, state.sorting_size, 128);
 			return state;
 		}
 	};
@@ -151,6 +153,14 @@ namespace CudaIntegrator
 	inline size_t required<BinningState>(size_t P_prime) {
 		return BinningState::required(P_prime); // Now BinningState is fully defined
 	}
+
+	// Add a return struct definition (can be inside the namespace or globally)
+	struct ForwardOutput {
+		int num_rendered;
+		void* geom_buffer_ptr;   // Use void* for generic pointer
+		void* binning_buffer_ptr;
+		void* image_buffer_ptr;
+	};
 }
 
 #endif // CUDA_INTEGRATOR_IMPL_H_INCLUDED
