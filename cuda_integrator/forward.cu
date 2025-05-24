@@ -24,7 +24,8 @@ namespace cg = cooperative_groups;
 // <<< NEW HELPER FUNCTIONS START >>> (Commented out as they are for rendering)
 
 // Perform initial steps for each primitive prior to sorting.
-__global__ void preprocessCUDA(int P,
+__global__ void preprocessCUDA(
+    int P,
 	const float* orig_points,
 	const float primitive_scale, // All primitives have the same scale
 	const float* viewmatrix,
@@ -149,7 +150,7 @@ renderCUDA(
     const uint2* __restrict__ ranges,          // Tile ranges in the sorted point list
     const uint32_t* __restrict__ point_list,    // Sorted list of primitive indices
     // Image dimensions
-    const int W, const int H,
+    const int W, const int H, const int P,
     // Camera parameters
     const float* __restrict__ viewmatrix,      // View matrix (float[16])
     const float* __restrict__ projmatrix,      // Projection matrix (float[16])
@@ -186,13 +187,16 @@ renderCUDA(
     float* __restrict__ out_delta_t,                 // Stores delta_t per pixel contribution (W*H*max_primitives_per_ray)
     // Runtime dimensions
     const uint32_t input_feature_dim,
+    
     const uint32_t output_feature_dim,
+    const uint32_t intermediate_feature_dim,
     const uint32_t hashgrid_levels
 )
 {
     // <<< Read camera center from pointer inside kernel >>>
     const float3 camera_center = {camera_center_vec[0], camera_center_vec[1], camera_center_vec[2]};
-
+    // printf("input feature dim: %d, output feature dim: %d, hashgrid levels: %d\n", input_feature_dim, output_feature_dim, hashgrid_levels);
+    
     // --- Define Maximum Compile-Time Dimensions ---
     const uint32_t MAX_INPUT_FEATURE_DIM = 4;
     const uint32_t MAX_OUTPUT_FEATURE_DIM = 4;
@@ -204,14 +208,14 @@ renderCUDA(
     // Total number of elements in the confidence grid (e.g., 3*3*3 = 27)
     const uint32_t grid_volume = (uint32_t)grid_size * grid_size * grid_size;
     // Dimension of the MLP input layer (concatenated features)
-    const uint32_t input_linear_dim = input_feature_dim * hashgrid_levels;
+    const uint32_t input_linear_dim = intermediate_feature_dim;
     // Dimension of the MLP output layer (RGB + Density + Output Features)
     const uint32_t output_linear_dim = CHANNELS + output_feature_dim + 1;
     const uint32_t MAX_OUTPUT_LINEAR_DIM = CHANNELS + MAX_OUTPUT_FEATURE_DIM + 1;
     const uint32_t MAX_INPUT_LINEAR_DIM = MAX_INPUT_FEATURE_DIM * MAX_HASHGRID_LEVELS;
     const uint32_t MAX_STENCIL_SIZE = 5;
-
-
+    // printf("input_linear_dim: %d, output_linear_dim: %d, input_feature_dim: %d, output_feature_dim: %d, intermediate_feature_dim: %d\n", input_linear_dim, output_linear_dim    , input_feature_dim, output_feature_dim, intermediate_feature_dim);
+    // printf("MAX_INPUT_LINEAR_DIM: %d, MAX_OUTPUT_LINEAR_DIM: %d\n", MAX_INPUT_LINEAR_DIM, MAX_OUTPUT_LINEAR_DIM);
     // --- Shared Memory Allocation ---
     __shared__ float stencil_coeffs_x[MAX_STENCIL_SIZE];
     __shared__ float stencil_coeffs_y[MAX_STENCIL_SIZE];
@@ -256,7 +260,7 @@ renderCUDA(
         if (num_tiles > 0) {
             // The .y component of the last range is the total number of rendered points
             uint32_t inferred_num_rendered = ranges[num_tiles - 1].y;
-            printf("[POINT LIST LENGTH] Inferred from ranges: %u\n", inferred_num_rendered);
+            // printf("[POINT LIST LENGTH] Inferred from ranges: %u\n", inferred_num_rendered);
         } else {
             printf("[POINT LIST LENGTH] Cannot infer, num_tiles is 0.\n");
         }
@@ -283,9 +287,9 @@ renderCUDA(
         if (num_tiles_for_check > 0) {
             inferred_num_rendered_for_check = ranges[num_tiles_for_check - 1].y;
         }
-        printf("[FWD RANGES CHECK TILE %u for P:%u] range.x: %u, range.y: %u (inferred num_rendered: %u)\n",
-               tile_idx, target_debug_pixel_id,
-               ranges[tile_idx].x, ranges[tile_idx].y, inferred_num_rendered_for_check );
+        // printf("[FWD RANGES CHECK TILE %u for P:%u] range.x: %u, range.y: %u (inferred num_rendered: %u)\n",
+        //        tile_idx, target_debug_pixel_id,
+        //        ranges[tile_idx].x, ranges[tile_idx].y, inferred_num_rendered_for_check );
     }
     // <<< END ADDED DEBUG PRINT for RANGES >>>
 
@@ -331,10 +335,9 @@ renderCUDA(
             shared_linear_bias[i] = linear_bias[i];
          }
     }
-    block.sync();
 
     const int stencil_size = shared_stencil_size;
-    const int stencil_offset = (stencil_size - 1) / 2;
+    // const int stencil_offset = (stencil_size - 1) / 2; // Will be defined inside STAGE 2 where it's first used
 
     // --- Per-Pixel Initialization ---
     float T = 1.0f;
@@ -343,153 +346,139 @@ renderCUDA(
 
     #pragma unroll
     for(int i=0; i<CHANNELS; ++i) C[i] = 0.0f;
-    for(uint32_t i=0; i<output_feature_dim; ++i) F[i] = 0.0f;
+    for(uint32_t i=0; i<output_feature_dim; ++i) F[i] = 0.0f; // Use runtime output_feature_dim
 
     uint32_t contributor_count = 0;
-    float last_view_depth = near_plane;
+    // bool inside = pix.x < W && pix.y < H; // Already defined earlier
+
+    // State for deferred accumulation
+    bool has_pending_primitive = false;
+    float pending_primitive_properties[MAX_OUTPUT_LINEAR_DIM]; // Stores sigmoid(color), sigmoid(features), density_logit
+    float pending_view_depth = near_plane; // Depth of the pending primitive
+    uint32_t pending_point_list_idx_for_output; // Index in the original point_list (e.g. range.x + offset + j_batch)
+    float T_at_pending_primitive_start; // Stores T *before* the pending primitive would be composited
+
 
     // --- Process Primitives for this Tile (Batched Approach) ---
-    uint2 range = ranges[tile_idx];
+    const uint2 range = ranges[tile_idx];
     const int num_primitives_in_tile = range.y - range.x;
     const int rounds = (num_primitives_in_tile + threads_per_block - 1) / threads_per_block;
     int primitives_to_do_in_tile = num_primitives_in_tile;
-    // Debug: Print the number of primitives to do in the tile
-    if (thread_idx_in_block == 0) {
-        printf("[FWD DEBUG] num_primitives_in_tile: %u, rounds: %u, threads_per_block: %u, range.x: %u, range.y: %u\n", num_primitives_in_tile, rounds, threads_per_block, range.x, range.y);
-    }
     for (int r = 0; r < rounds; ++r, primitives_to_do_in_tile -= threads_per_block) {
         // Early exit if all threads in the block are done with their pixels
         int num_done_threads = __syncthreads_count(done_processing_pixel);
-        if (num_done_threads == threads_per_block) { // threads_per_block is block.size()
+        if (num_done_threads == threads_per_block) {
             break;
         }
-        if (done_processing_pixel) { // If this specific thread is done, it still participates in syncs
-             // but won't do heavy computation. It can help in fetching if needed.
-        }
-
+        // If this specific thread is done, it still participates in syncs
+        // but won't do heavy computation.
 
         // Collectively fetch primitive indices for the current batch
         int current_batch_offset = r * threads_per_block;
         if (thread_idx_in_block < primitives_to_do_in_tile && (current_batch_offset + thread_idx_in_block < num_primitives_in_tile) ) {
             collected_primitive_indices[thread_idx_in_block] = point_list[range.x + current_batch_offset + thread_idx_in_block];
         }
-        block.sync();
+        block.sync(); // Sync after loading collected_primitive_indices
 
-        // // <<< DEBUG: Print range.x, range.y, batch offset, thread_idx_in_block, and current batch offset >>>
-        // if (thread_idx_in_block == 0) {
-        //     printf("[FWD DEBUG] range.x: %u, range.y: %u, batch_offset: %u, thread_idx_in_block: %u, threads_per_block: %u, r: %u\n",
-        //            range.x, range.y, current_batch_offset, thread_idx_in_block, threads_per_block, r);
-        // }
-        // DEBUG: Print range.x and range.y
-        // if (thread_idx_in_block == 0) {
-        //     printf("[FWD DEBUG] range.x: %u, range.y: %u\n", range.x, range.y);
-        // }
-        // Iterate over primitives in the current fetched batch
         for (int j_batch = 0; j_batch < min((int)threads_per_block, primitives_to_do_in_tile); ++j_batch) {
-            if (done_processing_pixel || contributor_count >= max_primitives_per_ray || T < 1e-4f) {
-                // This thread is done with its pixel, but needs to stay in sync for shared memory ops for other threads
-                // or for subsequent primitives in the batch if not all threads are done.
-                // A simple break here might desync, better to skip heavy work.
-                // The outer cg::all check handles full block exit.
-                // If this thread is done, it won't contribute further.
-            }
+            // --- Get Primitive Data (common for all threads in block for STAGE 1) ---
+            uint32_t primitive_idx_from_point_list = collected_primitive_indices[j_batch];
 
-            if (!done_processing_pixel && contributor_count < max_primitives_per_ray && T >= 1e-4f) {
-                // --- Get Primitive Data for current primitive in batch ---
-                uint32_t primitive_idx = collected_primitive_indices[j_batch]; 
+            float3 center = {
+                primitive_centers[primitive_idx_from_point_list * 3 + 0],
+                primitive_centers[primitive_idx_from_point_list * 3 + 1],
+                primitive_centers[primitive_idx_from_point_list * 3 + 2]
+            };
 
-                float3 center = {
-                    primitive_centers[primitive_idx * 3 + 0],
-                    primitive_centers[primitive_idx * 3 + 1],
-                    primitive_centers[primitive_idx * 3 + 2]
-                };
+            // --- STAGE 1: Cooperatively Load Confidence, Project Grid Points, Interpolate Features, AND COMPUTE MLP per Grid Point ---
+            // This stage computes `sh_mlp_output_per_grid_point` which contains raw logits from MLP.
+            const float grid_step = (grid_size > 1) ? primitive_scale / (float)(grid_size - 1) : primitive_scale;
+            const float grid_offset_factor = (grid_size - 1) / 2.0f;
+            // DEBUG FOR A POINT PRINT THE sample_pos_world_sh
+            // if (pix_id == target_debug_pixel_id){
+            //     printf("sample_pos_world_sh: %f, %f, %f\n", sample_pos_world_sh.x, sample_pos_world_sh.y, sample_pos_world_sh.z);
+            // }
+            for (uint32_t flat_idx_sh = thread_idx_in_block; flat_idx_sh < grid_volume; flat_idx_sh += threads_per_block) {
+                if (flat_idx_sh >= MAX_GRID_VOLUME || flat_idx_sh < 0) continue;
 
-                float3 p_view_center = transformPoint4x3(center, viewmatrix); 
-                float view_depth_center = p_view_center.z; 
-                float delta_t = max(0.0f, view_depth_center - last_view_depth);
-
-                // --- Cooperatively Load Confidence, Project Grid Points, Interpolate Features, AND COMPUTE MLP per Grid Point ---
-                const float grid_step = (grid_size > 1) ? primitive_scale / (float)(grid_size - 1) : primitive_scale;
-                const float grid_offset_factor = (grid_size - 1) / 2.0f;
-                
-                for (uint32_t flat_idx_sh = thread_idx_in_block; flat_idx_sh < grid_volume; flat_idx_sh += threads_per_block) {
-                    if (flat_idx_sh >= MAX_GRID_VOLUME) continue;
-
-                    // Initialize features and MLP output for this grid point to 0.0f
-                    for (uint32_t f_idx = 0; f_idx < MAX_INPUT_LINEAR_DIM; ++f_idx) {
-                        sh_interpolated_features_for_primitive[flat_idx_sh * MAX_INPUT_LINEAR_DIM + f_idx] = 0.0f;
-                    }
-                    for (uint32_t o_idx = 0; o_idx < MAX_OUTPUT_LINEAR_DIM; ++o_idx) {
-                        sh_mlp_output_per_grid_point[flat_idx_sh * MAX_OUTPUT_LINEAR_DIM + o_idx] = 0.0f;
-                    }
-
-                    sh_confidence[flat_idx_sh] = primitive_confidences[(uint64_t)primitive_idx * grid_volume + flat_idx_sh];
-
-                
-                    int z_coord = flat_idx_sh / (grid_size * grid_size);
-                    int rem = flat_idx_sh % (grid_size * grid_size);
-                    int y_coord = rem / grid_size;
-                    int x_coord = rem % grid_size;
-
-                    float sample_rel_x = (x_coord - grid_offset_factor) * grid_step;
-                    float sample_rel_y = (y_coord - grid_offset_factor) * grid_step;
-                    float sample_rel_z = (z_coord - grid_offset_factor) * grid_step;
-                    float3 sample_pos_world_sh = {
-                        center.x + sample_rel_x,
-                        center.y + sample_rel_y,
-                        center.z + sample_rel_z
-                    };
-                    
-                    float4 p_hom_grid = transformPoint4x4(sample_pos_world_sh, projmatrix);
-                    
-                    float p_w_grid = 1.0f / p_hom_grid.w;
-                    float3 p_proj_grid = { p_hom_grid.x * p_w_grid, p_hom_grid.y * p_w_grid, p_hom_grid.z * p_w_grid };
-                    sh_screen_coords[flat_idx_sh] = { ndc2Pix(p_proj_grid.x, W), ndc2Pix(p_proj_grid.y, H) };
-                    
-                    for (int current_level_loop = 0; current_level_loop < hashgrid_levels; ++current_level_loop) {
-                        hashInterpolateShared( 
-                            sample_pos_world_sh, current_level_loop, feature_table, resolution,
-                            feature_offset, do_hash[current_level_loop], primes,
-                            &sh_interpolated_features_for_primitive[flat_idx_sh * MAX_INPUT_LINEAR_DIM],
-                            input_feature_dim, hashgrid_levels,
-                            MAX_INPUT_LINEAR_DIM, input_linear_dim);
-                    }
-
-                    // --- Perform MLP for this grid point (flat_idx_sh) ---
-                    float* current_grid_point_features = &sh_interpolated_features_for_primitive[flat_idx_sh * MAX_INPUT_LINEAR_DIM];
-                    float* current_grid_point_mlp_output = &sh_mlp_output_per_grid_point[flat_idx_sh * MAX_OUTPUT_LINEAR_DIM];
-
-                    for (uint32_t out_f = 0; out_f < output_linear_dim; ++out_f) {
-                        if (out_f < MAX_OUTPUT_LINEAR_DIM) {
-                            float dot_prod = shared_linear_bias[out_f]; // Initialize with bias
-                            for (uint32_t in_f = 0; in_f < input_linear_dim; ++in_f) {
-                                if (in_f < MAX_INPUT_LINEAR_DIM) { // Check against compile-time max for safety
-                                    // Ensure shared_linear_weights indexing is correct:
-                                    // It's typically (out_dim, in_dim) flattened row-major.
-                                    // So, index is out_f * MAX_INPUT_LINEAR_DIM + in_f
-                                    dot_prod += shared_linear_weights[out_f * MAX_INPUT_LINEAR_DIM + in_f] * current_grid_point_features[in_f];
-                                }
-                            }
-                            current_grid_point_mlp_output[out_f] = dot_prod;
-                        }
-                    }
-                    
-                    
-                } // End cooperative loop
-                block.sync(); // Ensure all shared memory writes (confidence, screen_coords, features, MLP_outputs) are complete
-                //DEBUG: Print range.x and range.y
-                // if (thread_idx_in_block == 0) {
-                //     printf("[FWD DEBUG] range.x: %u, range.y: %u\n", range.x, range.y);
-                // }
-                // --- STAGE 2: Per-Thread: Accumulate Weighted MLP Outputs from Grid Points ---
-                float primitive_outputs[MAX_OUTPUT_LINEAR_DIM]; 
-                for(uint32_t k=0; k<output_linear_dim; ++k) {
-                    if (k < MAX_OUTPUT_LINEAR_DIM) primitive_outputs[k] = 0.0f;
+                // Initialize features and MLP output for this grid point to 0.0f
+                for (uint32_t f_idx = 0; f_idx < input_linear_dim; ++f_idx) {
+                    sh_interpolated_features_for_primitive[flat_idx_sh * input_linear_dim + f_idx] = 0.0f;
+                }
+                for (uint32_t o_idx = 0; o_idx < output_linear_dim; ++o_idx) {
+                    sh_mlp_output_per_grid_point[flat_idx_sh * output_linear_dim + o_idx] = 0.0f;
                 }
 
-                const int stencil_offset = (stencil_size - 1) / 2; // e.g., for size 3, offset is 1 (s goes 0,1,2 -> stencil_idx -1,0,1)
+                sh_confidence[flat_idx_sh] = primitive_confidences[(uint64_t)primitive_idx_from_point_list * grid_volume + flat_idx_sh];
+                // if(primitive_idx_from_point_list>P){
+                
+                // }
+                int z_coord = flat_idx_sh / (grid_size * grid_size);
+                int rem = flat_idx_sh % (grid_size * grid_size);
+                int y_coord = rem / grid_size;
+                int x_coord = rem % grid_size;
 
-                for (uint32_t flat_idx_center = 0; flat_idx_center < grid_volume; ++flat_idx_center) { // Renamed flat_idx to flat_idx_center for clarity
+                float sample_rel_x = (x_coord - grid_offset_factor) * grid_step;
+                float sample_rel_y = (y_coord - grid_offset_factor) * grid_step;
+                float sample_rel_z = (z_coord - grid_offset_factor) * grid_step;
+                float3 sample_pos_world_sh = {
+                    center.x + sample_rel_x,
+                    center.y + sample_rel_y,
+                    center.z + sample_rel_z
+                };
+
+                float4 p_hom_grid = transformPoint4x4(sample_pos_world_sh, projmatrix);
+
+                float p_w_grid = 1.0f / (p_hom_grid.w+ 0.0000001f);
+                float3 p_proj_grid = { p_hom_grid.x * p_w_grid, p_hom_grid.y * p_w_grid, p_hom_grid.z * p_w_grid };
+                if (flat_idx_sh >= 0 && flat_idx_sh < MAX_GRID_VOLUME) // Bounds check for flat_idx_sh
+                
+                sh_screen_coords[flat_idx_sh] = { ndc2Pix(p_proj_grid.x, W), ndc2Pix(p_proj_grid.y, H) };
+                
+                for (int current_level_loop = 0; current_level_loop < hashgrid_levels; ++current_level_loop) {
+                    hashInterpolateShared(
+                        sample_pos_world_sh, current_level_loop, feature_table, resolution,
+                        feature_offset, do_hash[current_level_loop], primes,
+                        &sh_interpolated_features_for_primitive[flat_idx_sh * MAX_INPUT_LINEAR_DIM],
+                        input_feature_dim, hashgrid_levels,
+                        MAX_INPUT_LINEAR_DIM, input_linear_dim);
+                }
+
+                // --- Perform MLP for this grid point (flat_idx_sh) ---
+                float* current_grid_point_features = &sh_interpolated_features_for_primitive[flat_idx_sh * MAX_INPUT_LINEAR_DIM];
+                float* current_grid_point_mlp_output = &sh_mlp_output_per_grid_point[flat_idx_sh * MAX_OUTPUT_LINEAR_DIM];
+
+                for (uint32_t out_f = 0; out_f < output_linear_dim; ++out_f) {
+                    if (out_f < MAX_OUTPUT_LINEAR_DIM) {
+                        float dot_prod = 0.0f; // Initialize with bias
+                        
+                        for (uint32_t in_f = 0; in_f < input_linear_dim; ++in_f) {
+                            if (in_f < MAX_INPUT_LINEAR_DIM) {
+                                dot_prod += shared_linear_weights[out_f * MAX_INPUT_LINEAR_DIM + in_f] * current_grid_point_features[in_f];
+                            }
+                        }
+                        current_grid_point_mlp_output[out_f] = dot_prod; // Store raw weighted sum of features
+                    }
+                }
+            } // End cooperative loop for STAGE 1
+            block.sync(); // Ensure all shared memory writes from STAGE 1 (sh_mlp_output_per_grid_point etc.) are complete
+
+            // --- Per-Pixel Processing (if this thread's pixel is not done) ---
+            if (!done_processing_pixel) {
+                float3 p_view_center_thread = transformPoint4x3(center, viewmatrix); // Thread-local view transform
+                float current_primitive_view_depth = p_view_center_thread.z;
+                uint32_t current_primitive_point_list_idx = range.x + current_batch_offset + j_batch;
+
+                // --- STAGE 2: Per-Thread: Accumulate Weighted MLP Outputs from Grid Points, Apply Bias & Activation ---
+                float current_properties_activated[MAX_OUTPUT_LINEAR_DIM]; // To store sigmoid(C), sigmoid(F), density_logit
+                for(uint32_t k=0; k<output_linear_dim; ++k) { // Initialize accumulator
+                    if (k < MAX_OUTPUT_LINEAR_DIM) current_properties_activated[k] = 0.0f;
+                }
+
+                const int current_stencil_offset = (stencil_size - 1) / 2;
+                float occupancy_grad_sum = 0.0f;
+                float2 current_proj = {0.0f, 0.0f};
+                for (uint32_t flat_idx_center = 0; flat_idx_center < grid_volume; ++flat_idx_center) {
                     if (flat_idx_center >= MAX_GRID_VOLUME) continue;
 
                     // --- Calculate Occupancy Gradient using sh_screen_coords ---
@@ -500,12 +489,74 @@ renderCUDA(
                     int rem_c = flat_idx_center % (grid_size * grid_size);
                     int y_c = rem_c / grid_size;
                     int x_c = rem_c % grid_size;
+                    current_proj = sh_screen_coords[flat_idx_center];
+                    if ((!(current_proj.x >= pix.x && current_proj.x < (pix.x + 1.0f) &&
+                                        current_proj.y >= pix.y && current_proj.y < (pix.y + 1.0f)))  || (sh_confidence[flat_idx_center] <= 0.0f)){
+                        continue;
+                    }   
+                    // if (stencil_size > 0) {
+                    //     for (int s = 0; s < stencil_size; s++) {
+                    //         int stencil_relative_offset = s - current_stencil_offset;
+                    //         char occ_x_neighbor = 0, occ_y_neighbor = 0, occ_z_neighbor = 0;
 
-                    if (stencil_size > 0) { 
+                    //         // X-gradient neighbor
+                    //         int nx_coord = x_c + stencil_relative_offset;
+                    //         if (nx_coord >= 0 && nx_coord < grid_size) { // Check bounds for neighbor grid coord
+                    //             uint32_t flat_nx_idx = (uint32_t)z_c * grid_size * grid_size + (uint32_t)y_c * grid_size + (uint32_t)nx_coord;
+                    //             if (flat_nx_idx < MAX_GRID_VOLUME) { // Check bounds for flat index
+                    //                 float2 neighbor_screen_coords = sh_screen_coords[flat_nx_idx];
+                    //                 // Check if the neighbor_screen_coords (pre-projected) fall into the current pixel
+                    //                 if (neighbor_screen_coords.x >= pix.x && neighbor_screen_coords.x < (pix.x + 1.0f) &&
+                    //                     neighbor_screen_coords.y >= pix.y && neighbor_screen_coords.y < (pix.y + 1.0f)) {
+                    //                     grad_x += stencil_coeffs_x[s];
+                    //                 }
+                    //             }
+                    //         }
+ 
+                    //         // Y-gradient neighbor
+                    //         int ny_coord = y_c + stencil_relative_offset;
+                    //         if (ny_coord >= 0 && ny_coord < grid_size) { 
+                    //             uint32_t flat_ny_idx = (uint32_t)z_c * grid_size * grid_size + (uint32_t)ny_coord * grid_size + (uint32_t)x_c;
+                    //             if (flat_ny_idx < MAX_GRID_VOLUME) {
+                    //                 float2 neighbor_screen_coords = sh_screen_coords[flat_ny_idx];
+                    //                 if (neighbor_screen_coords.x >= pix.x && neighbor_screen_coords.x < (pix.x + 1.0f) &&
+                    //                     neighbor_screen_coords.y >= pix.y && neighbor_screen_coords.y < (pix.y + 1.0f)) {
+                    //                     grad_y += stencil_coeffs_y[s];
+                    //                 }
+                    //             }
+                    //         }
+ 
+                    //         // Z-gradient neighbor
+                    //         int nz_coord = z_c + stencil_relative_offset;
+                    //         if (nz_coord >= 0 && nz_coord < grid_size) { 
+                    //             uint32_t flat_nz_idx = (uint32_t)nz_coord * grid_size * grid_size + (uint32_t)y_c * grid_size + (uint32_t)x_c;
+                    //             if (flat_nz_idx < MAX_GRID_VOLUME) {
+                    //                 float2 neighbor_screen_coords = sh_screen_coords[flat_nz_idx];
+                    //                 if (neighbor_screen_coords.x >= pix.x && neighbor_screen_coords.x < (pix.x + 1.0f) &&
+                    //                     neighbor_screen_coords.y >= pix.y && neighbor_screen_coords.y < (pix.y + 1.0f)) {
+                    //                     grad_z += stencil_coeffs_z[s];
+                    //                 }
+                    //             }
+                    //         }
+                    //     }
+                    // } else { // No stencil / point sampling - check only the center point
+                    //     float2 center_screen_coords = sh_screen_coords[flat_idx_center];
+                    //     if (center_screen_coords.x >= pix.x && center_screen_coords.x < (pix.x + 1.0f) &&
+                    //         center_screen_coords.y >= pix.y && center_screen_coords.y < (pix.y + 1.0f)) {
+                    //         // If point sampling, and it's in the pixel, it has full "gradient" or contribution
+                    //         // The concept of gradient is a bit different here.
+                    //         // Let's assume a default contribution if it's in the pixel.
+                    //         // This part might need refinement based on desired behavior for stencil_size == 0
+                    //         grad_x = 1.0f; // Or some other default to indicate presence
+                    //         grad_y = 1.0f;
+                    //         grad_z = 1.0f; 
+                    //         // Or, occupancy_grad_magnitude could be set directly to 1.0f here.
+                    //     }
+                    // }
+
+                    if (stencil_size > 0) {
                         for (int s = 0; s < stencil_size; s++) {
-                            // Relative stencil offset (e.g., -1, 0, 1 for 3-point stencil)
-                            int stencil_relative_offset = s - stencil_offset; 
-
+                            int stencil_relative_offset = s - current_stencil_offset;
                             char occ_x_neighbor = 0, occ_y_neighbor = 0, occ_z_neighbor = 0;
 
                             // X-gradient neighbor
@@ -513,43 +564,34 @@ renderCUDA(
                             if (nx_coord >= 0 && nx_coord < grid_size) { // Check bounds for neighbor grid coord
                                 uint32_t flat_nx_idx = (uint32_t)z_c * grid_size * grid_size + (uint32_t)y_c * grid_size + (uint32_t)nx_coord;
                                 if (flat_nx_idx < MAX_GRID_VOLUME) { // Check bounds for flat index
-                                    float2 neighbor_screen_coords = sh_screen_coords[flat_nx_idx];
-                                    // Check if the neighbor_screen_coords (pre-projected) fall into the current pixel
-                                    if (neighbor_screen_coords.x >= pix.x && neighbor_screen_coords.x < (pix.x + 1.0f) &&
-                                        neighbor_screen_coords.y >= pix.y && neighbor_screen_coords.y < (pix.y + 1.0f)) {
-                                        occ_x_neighbor = 1;
+                                    
+                                    if (sh_confidence[flat_nx_idx] > 0.0f) {
+                                        grad_x += stencil_coeffs_x[s];
                                     }
                                 }
                             }
-                            grad_x += stencil_coeffs_x[s] * (float)occ_x_neighbor;
  
                             // Y-gradient neighbor
                             int ny_coord = y_c + stencil_relative_offset;
                             if (ny_coord >= 0 && ny_coord < grid_size) { 
                                 uint32_t flat_ny_idx = (uint32_t)z_c * grid_size * grid_size + (uint32_t)ny_coord * grid_size + (uint32_t)x_c;
                                 if (flat_ny_idx < MAX_GRID_VOLUME) {
-                                    float2 neighbor_screen_coords = sh_screen_coords[flat_ny_idx];
-                                    if (neighbor_screen_coords.x >= pix.x && neighbor_screen_coords.x < (pix.x + 1.0f) &&
-                                        neighbor_screen_coords.y >= pix.y && neighbor_screen_coords.y < (pix.y + 1.0f)) {
-                                        occ_y_neighbor = 1;
+                                    if (sh_confidence[flat_ny_idx] > 0.0f) {
+                                        grad_y += stencil_coeffs_y[s];
                                     }
                                 }
                             }
-                            grad_y += stencil_coeffs_y[s] * (float)occ_y_neighbor;
  
                             // Z-gradient neighbor
                             int nz_coord = z_c + stencil_relative_offset;
                             if (nz_coord >= 0 && nz_coord < grid_size) { 
                                 uint32_t flat_nz_idx = (uint32_t)nz_coord * grid_size * grid_size + (uint32_t)y_c * grid_size + (uint32_t)x_c;
                                 if (flat_nz_idx < MAX_GRID_VOLUME) {
-                                    float2 neighbor_screen_coords = sh_screen_coords[flat_nz_idx];
-                                    if (neighbor_screen_coords.x >= pix.x && neighbor_screen_coords.x < (pix.x + 1.0f) &&
-                                        neighbor_screen_coords.y >= pix.y && neighbor_screen_coords.y < (pix.y + 1.0f)) {
-                                        occ_z_neighbor = 1;
+                                    if (sh_confidence[flat_nz_idx] > 0.0f) {
+                                        grad_z += stencil_coeffs_z[s];
                                     }
                                 }
                             }
-                            grad_z += stencil_coeffs_z[s] * (float)occ_z_neighbor;
                         }
                     } else { // No stencil / point sampling - check only the center point
                         float2 center_screen_coords = sh_screen_coords[flat_idx_center];
@@ -565,156 +607,171 @@ renderCUDA(
                             // Or, occupancy_grad_magnitude could be set directly to 1.0f here.
                         }
                     }
-
-                    float occupancy_grad_magnitude = fabsf(grad_x) + fabsf(grad_y) + fabsf(grad_z) + 1.0f; // L1 norm
-                    // Alternative: float occupancy_grad_magnitude = sqrtf(grad_x*grad_x + grad_y*grad_y + grad_z*grad_z); // L2 norm
-
-                    if (occupancy_grad_magnitude > 1e-7f) {
-                        float weight = sh_confidence[flat_idx_center] * occupancy_grad_magnitude; 
-
+                    
+                    float occupancy_grad_magnitude = fabsf(grad_x) + fabsf(grad_y) + fabsf(grad_z);
+                    occupancy_grad_sum += occupancy_grad_magnitude;
+                    if (occupancy_grad_magnitude > 1e-7f) { 
+                        
+                        float confidence_weight = sh_confidence[flat_idx_center] * occupancy_grad_magnitude;
                         float* mlp_output_for_grid_point = &sh_mlp_output_per_grid_point[flat_idx_center * MAX_OUTPUT_LINEAR_DIM];
-                        for (uint32_t k = 0; k < output_linear_dim; ++k) { // Loop for color and features
-                            if (k < output_linear_dim) { // Check against shared memory max bound
-                                primitive_outputs[k] += mlp_output_for_grid_point[k] * weight + shared_linear_bias[k];
-                                primitive_outputs[k] = (1.0f / (1.0f + expf(-primitive_outputs[k]))); // Sigmoid
+                        for (uint32_t k = 0; k < output_linear_dim; ++k) {
+                            if (k < MAX_OUTPUT_LINEAR_DIM) {
+                                current_properties_activated[k] += mlp_output_for_grid_point[k] * confidence_weight;
+                                
+                                
+                                
                             }
                         }
-                        // Density (last element) - often handled differently (e.g. ReLU or exp)
-                        // uint32_t density_output_idx = output_linear_dim - 1;
-                        // if (density_output_idx < MAX_OUTPUT_LINEAR_DIM) {
-                        //      primitive_outputs[density_output_idx] += mlp_output_for_grid_point[density_output_idx] * weight + shared_linear_bias[density_output_idx];
-                        //      // Density activation (e.g., expf for NeRF-like density, or ReLU) will be applied later
+                                            
+                    }
+                } // End loop over flat_idx_center for STAGE 2 accumulation
+                
+                if (occupancy_grad_sum < 1e-7f){
+                    continue;
+                }
+
+                for (uint32_t k = 0; k < output_linear_dim; ++k) {
+                    if (k < MAX_OUTPUT_LINEAR_DIM) {
+                        current_properties_activated[k] += shared_linear_bias[k];
+                        if (k<output_linear_dim-1){
+                            current_properties_activated[k] = (1.0f/(1.0f + expf(-current_properties_activated[k])));
+                        }
+                        else{
+                            current_properties_activated[k] = expf(current_properties_activated[k]);
+                        }   
+                    }
+                }
+            
+                
+                // Now current_properties_activated holds: sigmoid(Color), sigmoid(Features), DensityLogit
+
+                // --- Process Pending Primitive (if any) using current_primitive_view_depth ---
+                if (has_pending_primitive) {
+                    float delta_t_for_pending = max(0.0f, current_primitive_view_depth - pending_view_depth);
+
+                    // Only contribute if segment is meaningful and we haven't hit max contributors
+                    if (delta_t_for_pending > 1e-5f && contributor_count < max_primitives_per_ray) {
+                        float pending_density = pending_primitive_properties[output_linear_dim - 1];
+                        
+
+                        float alpha = 1.0f - expf(-pending_density * delta_t_for_pending);
+                        alpha = min(max(alpha, 0.0f), 1.0f); // Clamp alpha
+                        float comp_weight = T_at_pending_primitive_start * alpha;
+
+                        #pragma unroll
+                        for (int c_idx = 0; c_idx < CHANNELS; c_idx++) C[c_idx] += comp_weight * pending_primitive_properties[c_idx];
+
+                        for (uint32_t f_idx = 0; f_idx < output_feature_dim; f_idx++) {
+                            uint32_t source_idx = CHANNELS + f_idx;
+                            if (source_idx < output_linear_dim - 1 && source_idx < MAX_OUTPUT_LINEAR_DIM) { // Ensure it's a feature
+                                 F[f_idx] += comp_weight * pending_primitive_properties[source_idx];
+                            }
+                        }
+                        T = T_at_pending_primitive_start * (1.0f - alpha);
+
+                        if (out_pixel_contributing_indices != nullptr) {
+                             int write_idx = pix_id * max_primitives_per_ray + contributor_count;
+                             out_pixel_contributing_indices[write_idx] = pending_point_list_idx_for_output;
+                             if (out_delta_t != nullptr) {
+                                 out_delta_t[write_idx] = delta_t_for_pending;
+                             }
+                        }
+                        // if (inside && pix_id == target_debug_pixel_id && alpha > 0.01f) {
+                        //     printf("[renderCUDA DBG P:%d Prim:%u (pending)] contrib#:%d, depth:%.2f->%.2f, dt:%.4f, dens:%.4f, alpha:%.4f, T_start:%.4f, T_end:%.4f\n",
+                        //            pix_id, pending_point_list_idx_for_output, contributor_count,
+                        //            pending_view_depth, current_primitive_view_depth, delta_t_for_pending, pending_density, alpha, T_at_pending_primitive_start, T);
                         // }
+                        contributor_count++;
                     }
-                } // End loop over flat_idx_center for accumulating weighted MLP outputs
-                
-                
-                uint32_t density_runtime_idx = output_linear_dim - 1; // Assuming density is the last output
-                float primitive_density = primitive_outputs[density_runtime_idx];
-                // if (density_runtime_idx < output_linear_dim) { // Check against shared memory max bound
-                //     primitive_density = expf(primitive_outputs[density_runtime_idx]); // Apply exp to final accumulated density logit
-                //     // primitive_density = 1.0f;
-                //     // primitive_density = max(0.0f, primitive_outputs[density_runtime_idx]); // Or ReLU
-                // }
+                } // End if (has_pending_primitive)
 
-                // --- Extract Activated Outputs (Color and Features) ---
-                float primitive_rgb[CHANNELS];
-                float primitive_features[MAX_OUTPUT_FEATURE_DIM];
-                #pragma unroll
-                for(int c=0; c<CHANNELS; ++c) primitive_rgb[c] = primitive_outputs[c];
-                for(uint32_t f=0; f<output_feature_dim; ++f) {
-                    uint32_t source_idx = CHANNELS + f;
-                    if (source_idx < MAX_OUTPUT_LINEAR_DIM) {
-                        primitive_features[f] = primitive_outputs[source_idx];
-                    } else {
-                        primitive_features[f] = 0.0f;
-                    }
-                }
-
-                // --- Calculate Alpha and Composite ---
-                float alpha = 1.0f - expf(-primitive_density * delta_t);
-                alpha = min(max(alpha, 0.0f), 1.0f); // Clamp alpha
-                float comp_weight = T * alpha; // Renamed from 'weight' to avoid confusion
-
-                #pragma unroll
-                for (int c = 0; c < CHANNELS; c++) C[c] += comp_weight * primitive_rgb[c];
-                // for (int c = 0; c < CHANNELS; c++) C[c] += comp_weight * 1.0f;
-                for (uint32_t f = 0; f < output_feature_dim; f++) F[f] += comp_weight * primitive_features[f];
-                T *= (1.0f - alpha);
-
-                // --- Store Primitive Index and Delta T for Backward Pass ---
-                // Note: primitive_idx here is the global index. The problem asks for 'i' which was the loop counter
-                // in the original code (index within the tile's point_list).
-                // We need to store the original index from point_list for this tile.
-                // The current primitive being processed is point_list[range.x + current_batch_offset + j_batch]
-                // So, the index to store is (range.x + current_batch_offset + j_batch)
-                // DEBUG: Print range.x and range.y
-                if (thread_idx_in_block == 0) {
-                    printf("[FWD DEBUG] range.x: %u, range.y: %u\n", range.x, range.y);
-                }
-                if (out_pixel_contributing_indices != nullptr) { // 'inside' check is implicitly handled by done_processing_pixel
-                     int write_idx = pix_id * max_primitives_per_ray + contributor_count;
-                     out_pixel_contributing_indices[write_idx] = range.x + current_batch_offset + j_batch; // Store index from original point_list for the tile
-                     if(pix_id == target_debug_pixel_id) {
-                        printf("[FWD DEBUG] write_idx: %d, pix_id: %d, contributor_count: %d, range.x: %u, current_batch_offset: %u, j_batch: %u, point_list[range.x + current_batch_offset + j_batch]: %u\n",
-                               write_idx, pix_id, contributor_count, range.x, current_batch_offset, j_batch, range.x + current_batch_offset + j_batch);
-                     }
-                     if (out_delta_t != nullptr) {
-                         out_delta_t[write_idx] = delta_t;
-                     }
-                }
-                last_view_depth = view_depth_center;
-                contributor_count++;
-
-                if (T < 1e-4f || contributor_count >= max_primitives_per_ray) {
-                    done_processing_pixel = true; // This pixel is done
-                }
-
-                // <<< DEBUG: Print values for the target pixel >>>
-                if (inside && pix_id == target_debug_pixel_id && alpha > 0.0f) {
-                    printf("[renderCUDA DBG P:%d Prim:%u] contrib_idx:%d, delta_t:%.4f, density:%.4f, alpha:%.4f, T_before:%.4f\n",
-                           pix_id, (unsigned int)(ranges[tile_idx].x + current_batch_offset + j_batch), contributor_count,
-                           delta_t, primitive_density, alpha, T);
-                }
-
-                if (inside && pix_id == target_debug_pixel_id) {
-                     printf("[renderCUDA DBG P:%d Prim:%u] T_after:%.4f\n", pix_id, (unsigned int)(ranges[tile_idx].x + current_batch_offset + j_batch), T);
-                }
-
-                if (inside) { // Only write if originally an 'inside' pixel
-                    // <<< DEBUG: Print final contributor_count for the target pixel >>>
-                    if (pix_id == target_debug_pixel_id) {
-                        printf("[renderCUDA DBG P:%d] Final contributor_count: %d, Final T: %.4f\n",
-                               pix_id, contributor_count, T);
-                    }
-
-                    #pragma unroll
-                    for (int c = 0; c < CHANNELS; c++) {
-                        float bg = (bg_color != nullptr) ? bg_color[c] : 0.0f;
-                        C[c] += comp_weight * primitive_rgb[c];
-                        out_color[c * H * W + pix_id] = C[c];
-                    }
-
-                    if (out_features != nullptr) {
-                        for (uint32_t f = 0; f < output_feature_dim; f++) {
-                            out_features[f * H * W + pix_id] = F[f];
+                // --- Current primitive becomes the new pending primitive ---
+                // Only if pixel is still active (T high enough, contributor count not maxed)
+                if (T >= 1e-4f && contributor_count < max_primitives_per_ray) {
+                    for(uint32_t k=0; k<output_linear_dim; ++k) {
+                        if (k < MAX_OUTPUT_LINEAR_DIM) {
+                            pending_primitive_properties[k] = current_properties_activated[k];
                         }
                     }
-                    if (visibility_info != nullptr) {
-                        visibility_info[pix_id] = 1.0f - T;
-                    }
-                    if (out_final_transmittance != nullptr) {
-                        out_final_transmittance[pix_id] = T;
-                    }
-                    if (out_num_contrib_per_pixel != nullptr) {
-                        out_num_contrib_per_pixel[pix_id] = contributor_count;
-                    }
+                    pending_view_depth = current_primitive_view_depth;
+                    pending_point_list_idx_for_output = current_primitive_point_list_idx;
+                    has_pending_primitive = true;
+                    T_at_pending_primitive_start = T; // Store current T for this new pending primitive
+                } else {
+                    // Pixel became inactive (T too low or max contributors reached by processing the previous pending primitive)
+                    // So, this current primitive cannot become pending.
+                    has_pending_primitive = false; // Ensure no new pending primitive is set
+                    done_processing_pixel = true;  // Mark pixel as done
                 }
-            } // end if !done_processing_pixel
-             block.sync(); // Sync after each primitive in batch to ensure all threads are ready for next primitive's shared mem load
-                           // or to correctly evaluate cg::all for early exit.
-        }
-        block.sync(); // --- End Loop Over Primitives in Batch (j_batch) ---
-    } // --- End Loop Over Batches (r) ---
-    block.sync();
-    // --- Finalize Pixel Color and Features ---
-    if (inside) { // Only write if originally an 'inside' pixel
-        // <<< DEBUG: Print final contributor_count for the target pixel >>>
-        if (pix_id == target_debug_pixel_id) {
-            printf("[renderCUDA DBG P:%d] Final contributor_count: %d, Final T: %.4f\n",
-                   pix_id, contributor_count, T);
-        }
 
+                // Update done_processing_pixel based on current T and contributor_count
+                // This check is somewhat redundant if the above 'else' sets done_processing_pixel,
+                // but it's a good safeguard.
+                if (T < 1e-4f || contributor_count >= max_primitives_per_ray) {
+                    done_processing_pixel = true;
+                }
+            } // end if (!done_processing_pixel) for this thread's pixel work
+
+            block.sync(); // Sync after each primitive in batch, for next primitive's STAGE 1 shared mem ops
+        } // --- End Loop Over Primitives in Batch (j_batch) ---
+    } // --- End Loop Over Batches (r) ---
+    block.sync(); // Sync after all r-loops are done by all threads in block.
+
+    // --- After the main loop, process the final pending primitive if any ---
+    if (inside && has_pending_primitive && T >= 1e-4f && contributor_count < max_primitives_per_ray) {
+        float delta_t_final = max(0.0f, max_distance - pending_view_depth);
+
+        if (delta_t_final > 1e-5f) {
+            float pending_density = pending_primitive_properties[output_linear_dim - 1];
+            
+
+            float alpha = 1.0f - expf(-pending_density * delta_t_final);
+            alpha = min(max(alpha, 0.0f), 1.0f);
+            float comp_weight = T_at_pending_primitive_start * alpha;
+            // printf("[renderCUDA DBG P:%d Prim:%u (final pending)] contrib#:%d, depth:%.2f->%.2f, dt:%.4f, dens:%.4f, alpha:%.4f, T_start:%.4f, T_end:%.4f\n",
+            //            pix_id, pending_point_list_idx_for_output, contributor_count,
+            //            pending_view_depth, max_distance, delta_t_final, pending_density, alpha, T_at_pending_primitive_start, T);
+            #pragma unroll
+            for (int c_idx = 0; c_idx < CHANNELS; c_idx++) C[c_idx] += comp_weight * pending_primitive_properties[c_idx];
+            for (uint32_t f_idx = 0; f_idx < output_feature_dim; f_idx++) {
+                uint32_t source_idx = CHANNELS + f_idx;
+                if (source_idx < output_linear_dim - 1 && source_idx < MAX_OUTPUT_LINEAR_DIM) {
+                     F[f_idx] += comp_weight * pending_primitive_properties[source_idx];
+                }
+            }
+            T = T_at_pending_primitive_start * (1.0f - alpha);
+
+            if (out_pixel_contributing_indices != nullptr) {
+                 int write_idx = pix_id * max_primitives_per_ray + contributor_count;
+                 out_pixel_contributing_indices[write_idx] = pending_point_list_idx_for_output;
+                 if (out_delta_t != nullptr) {
+                     out_delta_t[write_idx] = delta_t_final;
+                 }
+            }
+            // if (inside && pix_id == target_debug_pixel_id && alpha > 0.01f) {
+            //     printf("[renderCUDA DBG P:%d Prim:%u (final pending)] contrib#:%d, depth:%.2f->%.2f, dt:%.4f, dens:%.4f, alpha:%.4f, T_start:%.4f, T_end:%.4f\n",
+            //            pix_id, pending_point_list_idx_for_output, contributor_count,
+            //            pending_view_depth, max_distance, delta_t_final, pending_density, alpha, T_at_pending_primitive_start, T);
+            // }
+            contributor_count++;
+        }
+    }
+
+    // --- Finalize Pixel Color and Features (add background and write to output) ---
+    if (inside) {
         #pragma unroll
-        for (int c = 0; c < CHANNELS; c++) {
-            float bg = (bg_color != nullptr) ? bg_color[c] : 0.0f;
-            C[c] += T * bg;
-            out_color[c * H * W + pix_id] = C[c];
+        for (int c_idx = 0; c_idx < CHANNELS; c_idx++) {
+            float bg = (bg_color != nullptr) ? bg_color[c_idx] : 0.0f;
+            C[c_idx] += T * bg; // Add background contribution weighted by final T
+            C[c_idx] = min(max(C[c_idx], 0.0f), 1.0f);
+            out_color[c_idx * H * W + pix_id] = C[c_idx];
         }
 
         if (out_features != nullptr) {
-            for (uint32_t f = 0; f < output_feature_dim; f++) {
-                out_features[f * H * W + pix_id] = F[f];
+            for (uint32_t f_idx = 0; f_idx < output_feature_dim; f_idx++) {
+                if(f_idx < MAX_OUTPUT_FEATURE_DIM){
+                    out_features[f_idx * H * W + pix_id] = F[f_idx];
+                }
             }
         }
         if (visibility_info != nullptr) {
@@ -726,6 +783,11 @@ renderCUDA(
         if (out_num_contrib_per_pixel != nullptr) {
             out_num_contrib_per_pixel[pix_id] = contributor_count;
         }
+        // Final debug print for the target pixel
+        // if (pix_id == target_debug_pixel_id) {
+        //      printf("[renderCUDA DBG P:%d] Final Output. Contribs: %d, Final T: %.4f, Final C[0]: %.4f\n",
+        //             pix_id, contributor_count, T, (CHANNELS > 0 ? C[0] : 0.0f) );
+        // }
     }
 }
 
@@ -734,7 +796,7 @@ void FORWARD::render(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
 	const uint32_t* point_list,
-	int W, int H,
+	int W, int H, int P,
 	const float* viewmatrix,
 	const float* projmatrix,
 	const float* camera_center_vec,
@@ -764,19 +826,20 @@ void FORWARD::render(
     float* out_delta_t,
 	const uint32_t input_feature_dim,
 	const uint32_t output_feature_dim,
+    const uint32_t intermediate_feature_dim,
 	const uint32_t hashgrid_levels,
 	const uint32_t num_output_channels
 )
 {
-    printf("[FORWARD::render] About to launch renderCUDA kernel...\n");
-    fflush(stdout);
+    // printf("[FORWARD::render] About to launch renderCUDA kernel...\n");
+    // fflush(stdout);
 
 	// Determine which kernel template specialization to launch based on num_output_channels
 	if (num_output_channels == 3) {
 		renderCUDA<3> <<<grid, block>>> (
 			ranges,
 			point_list,
-			W, H,
+			W, H, P,
 			viewmatrix,
 			projmatrix,
 			camera_center_vec,
@@ -806,6 +869,7 @@ void FORWARD::render(
             out_delta_t,
 			input_feature_dim,
 			output_feature_dim,
+			intermediate_feature_dim,
 			hashgrid_levels);
 	} else {
 		// Handle unsupported channel count...
@@ -818,8 +882,8 @@ void FORWARD::render(
         printf("[FORWARD::render] CUDA kernel launch failed: %s\n", cudaGetErrorString(launch_err));
         fflush(stdout);
     } else {
-        printf("[FORWARD::render] renderCUDA kernel launch successful (or error check passed).\n");
-        fflush(stdout);
+        // printf("[FORWARD::render] renderCUDA kernel launch successful (or error check passed).\n");
+        // fflush(stdout);
     }
 }
 

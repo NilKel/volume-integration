@@ -105,6 +105,7 @@ IntegratePrimitivesCUDA(
     // Runtime Dimensions
     const uint32_t input_feature_dim,           // F: Feature dimension in hashgrid
     const uint32_t output_feature_dim,          // Output feature dimension (excluding RGB, density)
+    const uint32_t intermediate_feature_dim,   // Intermediate feature dimension
     const uint32_t hashgrid_levels,             // L: Number of hashgrid levels
     const uint32_t num_output_channels,         // Number of color channels (e.g., 3 for RGB)
     // Misc
@@ -176,7 +177,7 @@ IntegratePrimitivesCUDA(
         /* Outputs */         out_color.contiguous().data<float>(),
                               out_features.contiguous().data<float>(),
                               visibility_info.contiguous().data<float>(),
-        /* Runtime Dims */    input_feature_dim, output_feature_dim, hashgrid_levels, num_output_channels,
+        /* Runtime Dims */    input_feature_dim, output_feature_dim, intermediate_feature_dim, hashgrid_levels, num_output_channels,
         /* Optional Radii */  radii_internal.data<int>(), // Pass pointer, might be null if size 0
         /* Misc */            debug
       );
@@ -207,14 +208,13 @@ IntegratePrimitivesCUDA(
       // Check if ImageState can be reconstructed
       // This relies on CudaIntegrator::ImageState being defined and visible
       // (should come from cuda_integrator/integrator.h -> common_types.h)
-      size_t img_chunk_size_check = CudaIntegrator::ImageState::required(num_tiles_check, num_pixels, max_primitives_per_ray);
+      size_t img_chunk_size_check = CudaIntegrator::ImageState::required( num_pixels, max_primitives_per_ray);
 
       if (imgBuffer.nbytes() >= img_chunk_size_check) {
           // <<< MODIFIED: Store pointer in an lvalue before passing to fromChunk >>>
           char* imgBuffer_ptr = reinterpret_cast<char*>(imgBuffer.contiguous().data_ptr());
           CudaIntegrator::ImageState imgStateCheck = CudaIntegrator::ImageState::fromChunk(
               imgBuffer_ptr, // Pass the lvalue
-              num_tiles_check, // Use the num_tiles calculated for this check
               num_pixels,
               max_primitives_per_ray
           );
@@ -254,8 +254,8 @@ IntegratePrimitivesCUDA(
                       cudaMemcpyAsync(&h_max_contrib, d_max_contrib, sizeof(int), cudaMemcpyDeviceToHost, stream);
                       cudaStreamSynchronize(stream); // Wait for all operations on the stream
 
-                      printf("[Forward Check] num_contrib_per_pixel: SUM = %d, MAX = %d (over %d pixels)\n",
-                             h_sum_contrib, h_max_contrib, num_pixels);
+                    //   printf("[Forward Check] num_contrib_per_pixel: SUM = %d, MAX = %d (over %d pixels)\n",
+                    //          h_sum_contrib, h_max_contrib, num_pixels);
                       fflush(stdout);
 
                       // Free temporary device memory

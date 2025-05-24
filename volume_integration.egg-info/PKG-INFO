@@ -1,5 +1,0 @@
-Metadata-Version: 2.1
-Name: volume_integration
-Version: 0.1.0
-Summary: Volume integration library based on CUDA and PyTorch
-License-File: LICENSE.md

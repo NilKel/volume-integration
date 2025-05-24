@@ -60,6 +60,7 @@ namespace CudaIntegrator
 			float* visibility_info,
 			const uint32_t input_feature_dim,
 			const uint32_t output_feature_dim,
+			const uint32_t intermediate_feature_dim,
 			const uint32_t hashgrid_levels,
 			const uint32_t num_output_channels,
 			int* radii, // Optional override

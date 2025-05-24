@@ -146,8 +146,8 @@ unifiedBackwardKernel(
     auto block = cg::this_thread_block();
     uint32_t thread_idx_in_block = block.thread_rank();
     uint32_t threads_per_block = block.size(); // BLOCK_X * BLOCK_Y
-
-    uint32_t tile_idx = block.group_index().y * gridDim.x + block.group_index().x;
+    uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+    uint32_t tile_idx = block.group_index().y * horizontal_blocks + block.group_index().x;
     uint2 pix_min = {block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y};
     uint2 pix = {pix_min.x + thread_idx_in_block % BLOCK_X, pix_min.y + thread_idx_in_block / BLOCK_X}; // Corrected pix calculation
     uint32_t pix_id = W * pix.y + pix.x; // Global pixel index (row-major)
@@ -213,26 +213,28 @@ unifiedBackwardKernel(
     int num_contrib_pixel = 0;
     int current_pixel_next_contrib_idx = -1; // Index for pixel_contributing_indices, counts down
     
-    if (pix_id == DEBUG_PIX_ID) {
-        printf("[BKWD_DBG P:%u InitCheck] Checking inside=%d\n", pix_id, inside);
-    }
+    // if (pix_id == DEBUG_PIX_ID) {
+    //     printf("[BKWD_DBG P:%u InitCheck] Checking inside=%d\n", pix_id, inside);
+    // }
     if (inside) {
         num_contrib_pixel = num_contrib_per_pixel[pix_id];
         num_contrib_pixel = min(num_contrib_pixel, max_primitives_per_ray);
+        //We get the index of the last contributing primitive for this pixel
         current_pixel_next_contrib_idx = num_contrib_pixel - 1;
 
-        if (pix_id == DEBUG_PIX_ID) {
-            printf("[BKWD_DBG P:%u Init] Inside. num_contrib_pixel=%d, current_pixel_next_contrib_idx=%d\n",
-                   pix_id, num_contrib_pixel, current_pixel_next_contrib_idx);
-        }
-
+        // if (pix_id == DEBUG_PIX_ID) {
+        //     printf("[BKWD_DBG P:%u Init] Inside. num_contrib_pixel=%d, current_pixel_next_contrib_idx=%d\n",
+        //            pix_id, num_contrib_pixel, current_pixel_next_contrib_idx);
+        // }
+        //Initialize the gradients for the color
         for(int c=0; c<CHANNELS; ++c) {
             dL_dOut_pix_local[c] = dL_dOut_Color[c * H * W + pix_id];
             accum_blend_after[c] = (bg_color != nullptr) ? bg_color[c] : 0.0f;
         }
-        if (pix_id == DEBUG_PIX_ID && CHANNELS > 0) {
-            printf("[BKWD_DBG P:%u Init] dL_dOut_Color[0] (dL_dOut_pix_local[0]) = %f\n", pix_id, dL_dOut_pix_local[0]);
-        }
+        // if (pix_id == DEBUG_PIX_ID && CHANNELS > 0) {
+        //     printf("[BKWD_DBG P:%u Init] dL_dOut_Color[0] (dL_dOut_pix_local[0]) = %f\n", pix_id, dL_dOut_pix_local[0]);
+        // }
+        //Initialize the gradients for the features
         if (dL_dOut_Features != nullptr) {
             for(uint32_t f=0; f<output_feature_dim; ++f) {
                 dL_dOut_pix_local[CHANNELS + f] = dL_dOut_Features[f * H * W + pix_id];
@@ -250,19 +252,19 @@ unifiedBackwardKernel(
              accum_blend_after[d] = 0.0f;
         }
         T_current_pixel = final_T[pix_id];
-        if (pix_id == DEBUG_PIX_ID) {
-             printf("[BKWD_DBG P:%u Init] Initial T_current_pixel=%f\n", pix_id, T_current_pixel);
-        }
+        // if (pix_id == DEBUG_PIX_ID) {
+        //      printf("[BKWD_DBG P:%u Init] Initial T_current_pixel=%f\n", pix_id, T_current_pixel);
+        // }
     } else {
-        if (pix_id == DEBUG_PIX_ID) {
-            printf("[BKWD_DBG P:%u Init] Skipped (not inside).\n", pix_id);
-        }
+        // if (pix_id == DEBUG_PIX_ID) {
+        //     printf("[BKWD_DBG P:%u Init] Skipped (not inside).\n", pix_id);
+        // }
         for(uint32_t d=0; d<KERNEL_MAX_BLEND_DIM_USED; ++d) {
             dL_dOut_pix_local[d] = 0.0f;
             accum_blend_after[d] = 0.0f;
         }
         T_current_pixel = 1.0f; // Or 0.0f? If outside, final_T might be 1.0 if bg is black and T is for scene.
-                               // Let's assume final_T[pix_id] is valid even if 'inside' is false, or init to 1.
+                               // Let's assume final_T[pix_id] is valid even if 'inside' is false, or init to 1.0.
                                // Matching forward pass, if not rendered, T remains 1.0.
         num_contrib_pixel = 0;
         current_pixel_next_contrib_idx = -1;
@@ -276,10 +278,10 @@ unifiedBackwardKernel(
         int current_idx_in_global_point_list = range.x + k_rev_tile;
         uint32_t current_primitive_idx_for_block = point_list[current_idx_in_global_point_list];
 
-        if (pix_id == DEBUG_PIX_ID) {
-            printf("[BKWD_DBG P:%u Loop] k_rev_tile=%d, global_idx_in_point_list=%d, prim_idx_for_block=%u\n",
-                   pix_id, k_rev_tile, current_idx_in_global_point_list, current_primitive_idx_for_block);
-        }
+        // if (pix_id == DEBUG_PIX_ID) {
+        //     printf("[BKWD_DBG P:%u Loop] k_rev_tile=%d, global_idx_in_point_list=%d, prim_idx_for_block=%u\n",
+        //            pix_id, k_rev_tile, current_idx_in_global_point_list, current_primitive_idx_for_block);
+        // }
 
         if (current_primitive_idx_for_block >= P) continue; // Should not happen with valid point_list
 
@@ -293,7 +295,7 @@ unifiedBackwardKernel(
 
         // --- STAGE 1 (Collaborative): Recompute forward state for `current_primitive_idx_for_block` into shared memory ---
         for (uint32_t flat_idx_sh = thread_idx_in_block; flat_idx_sh < grid_volume; flat_idx_sh += threads_per_block) {
-            if (flat_idx_sh >= MAX_GRID_VOLUME_BW) continue;
+            if (flat_idx_sh >= MAX_GRID_VOLUME_BW || flat_idx_sh < 0) continue;
 
             // Initialize features and MLP output for this grid point to 0.0f
             for (uint32_t f_idx = 0; f_idx < MAX_INPUT_LINEAR_DIM_BW; ++f_idx) {
@@ -342,7 +344,7 @@ unifiedBackwardKernel(
 
             for (uint32_t out_f = 0; out_f < output_linear_dim; ++out_f) {
                 if (out_f < MAX_OUTPUT_LINEAR_DIM_BW) { // Check against compile-time max for shared memory write
-                    float dot_prod = shared_linear_bias[out_f]; // Initialize with bias (from shared)
+                    float dot_prod = 0.0f; // MODIFIED: Initialize with 0.0f; Bias is applied per-pixel in STAGE 2A
                     for (uint32_t in_f = 0; in_f < input_linear_dim; ++in_f) {
                         if (in_f < MAX_INPUT_LINEAR_DIM_BW) { // Check against compile-time max for shared memory read
                             // shared_linear_weights is [MAX_OUTPUT_LINEAR_DIM_BW, MAX_INPUT_LINEAR_DIM_BW]
@@ -350,7 +352,7 @@ unifiedBackwardKernel(
                             dot_prod += shared_linear_weights[out_f * MAX_INPUT_LINEAR_DIM_BW + in_f] * current_grid_point_features_sh[in_f];
                         }
                     }
-                    current_grid_point_mlp_output_sh[out_f] = dot_prod;
+                    current_grid_point_mlp_output_sh[out_f] = dot_prod; // Now stores (Weights * Features) for the grid point
                 }
             }
         }
@@ -358,10 +360,10 @@ unifiedBackwardKernel(
 
         // --- STAGE 2 (Per-Thread/Pixel processing) ---
         bool should_process_pixel = inside && current_pixel_next_contrib_idx >= 0;
-        if (pix_id == DEBUG_PIX_ID) {
-             printf("[BKWD_DBG P:%u S2 Check] Checking should_process_pixel: (inside=%d && current_pixel_next_contrib_idx=%d >= 0) -> %d\n",
-                    pix_id, inside, current_pixel_next_contrib_idx, should_process_pixel);
-        }
+        // if (pix_id == DEBUG_PIX_ID) {
+        //      printf("[BKWD_DBG P:%u S2 Check] Checking should_process_pixel: (inside=%d && current_pixel_next_contrib_idx=%d >= 0) -> %d\n",
+        //             pix_id, inside, current_pixel_next_contrib_idx, should_process_pixel);
+        // }
         if (should_process_pixel) {
             // Retrieve the stored point_list_idx for the current expected contributor
             uint32_t stored_point_list_idx_for_pixel = pixel_contributing_indices[pix_id * max_primitives_per_ray + current_pixel_next_contrib_idx];
@@ -376,155 +378,209 @@ unifiedBackwardKernel(
 
             bool primitive_matches_pixel = (current_primitive_idx_for_block == expected_global_primitive_id_for_pixel);
 
-            if (pix_id == DEBUG_PIX_ID) {
-                // Print the stored_point_list_idx as well for clarity
-                printf("[BKWD_DBG P:%u S2 MatchCheck] StoredPLI:%u, ExpectedGID:%u == CurrentGID:%u -> %d\n",
-                       pix_id, stored_point_list_idx_for_pixel, expected_global_primitive_id_for_pixel, current_primitive_idx_for_block, primitive_matches_pixel);
-            }
+            // if (pix_id == DEBUG_PIX_ID) {
+            //     // Print the stored_point_list_idx as well for clarity
+            //     printf("[BKWD_DBG P:%u S2 MatchCheck] StoredPLI:%u, ExpectedGID:%u == CurrentGID:%u -> %d\n",
+            //            pix_id, stored_point_list_idx_for_pixel, expected_global_primitive_id_for_pixel, current_primitive_idx_for_block, primitive_matches_pixel);
+            // }
 
             if (primitive_matches_pixel) {
                 // This pixel (thread) needs to process current_primitive_idx_for_block.
                 float delta_t_k = store_delta_t[pix_id * max_primitives_per_ray + current_pixel_next_contrib_idx];
 
                 // (A) Recompute Blend_k and primitive_density_k for THIS PIXEL using shared data
+                
+                // mlp_input_aggregated_pixel stores: Sum_grid( raw_features_grid * weight_pixel )
+                // This is needed for dL/dW and dL/d(raw_features_grid)
                 float mlp_input_aggregated_pixel[MAX_INPUT_LINEAR_DIM_BW];
                 for(uint32_t i=0; i<input_linear_dim; ++i) mlp_input_aggregated_pixel[i] = 0.0f;
-                for(uint32_t i=input_linear_dim; i<MAX_INPUT_LINEAR_DIM_BW; ++i) mlp_input_aggregated_pixel[i] = 0.0f;
+                // The second initialization loop for i >= input_linear_dim was correctly removed by your human_edit earlier.
 
+                // aggregated_mlp_times_features_pixel stores: Sum_grid( (W*raw_features_grid) * weight_pixel )
+                float aggregated_mlp_times_features_pixel[MAX_OUTPUT_LINEAR_DIM_BW];
+                for(uint32_t i=0; i<output_linear_dim; ++i) aggregated_mlp_times_features_pixel[i] = 0.0f;
+                // for(uint32_t i=output_linear_dim; i<MAX_OUTPUT_LINEAR_DIM_BW; ++i) aggregated_mlp_times_features_pixel[i] = 0.0f;
 
+                float2 current_proj = {0.0f, 0.0f};
                 // Loop over grid points of `current_primitive_idx_for_block`
                 for (uint32_t flat_idx_center = 0; flat_idx_center < grid_volume; ++flat_idx_center) {
                     if (flat_idx_center >= MAX_GRID_VOLUME_BW) continue;
 
-                    float grad_x_pixel = 0.0f, grad_y_pixel = 0.0f, grad_z_pixel = 0.0f;
+                    float grad_x = 0.0f, grad_y = 0.0f, grad_z = 0.0f;
                     int z_c = flat_idx_center / (grid_size * grid_size);
                     int rem_c = flat_idx_center % (grid_size * grid_size);
                     int y_c = rem_c / grid_size;
                     int x_c = rem_c % grid_size;
-
+                    current_proj = sh_screen_coords[flat_idx_center];
+                    // if (stencil_size > 0) {
+                    //     for (int s = 0; s < stencil_size; s++) {
+                    //         int stencil_relative_offset = s - stencil_offset;
+                    //         char occ_x_n = 0, occ_y_n = 0, occ_z_n = 0;
+                    //         int nx = x_c + stencil_relative_offset;
+                    //         if (nx >= 0 && nx < grid_size) {
+                    //             uint32_t flat_nx_idx = (uint32_t)z_c * grid_size * grid_size + (uint32_t)y_c * grid_size + (uint32_t)nx;
+                    //             if (flat_nx_idx < MAX_GRID_VOLUME_BW) {
+                    //                 float2 n_scr = sh_screen_coords[flat_nx_idx];
+                    //                 if (n_scr.x >= pix.x && n_scr.x < (pix.x + 1.0f) &&
+                    //                     n_scr.y >= pix.y && n_scr.y < (pix.y + 1.0f)) occ_x_n=1;
+                    //             }
+                    //         } grad_x_pixel += stencil_coeffs_x[s] * (float)occ_x_n;
+                    //         int ny = y_c + stencil_relative_offset;
+                    //         if (ny >= 0 && ny < grid_size) {
+                    //             uint32_t flat_ny_idx = (uint32_t)z_c * grid_size * grid_size + (uint32_t)ny * grid_size + (uint32_t)x_c;
+                    //             if (flat_ny_idx < MAX_GRID_VOLUME_BW) {
+                    //                 float2 n_scr = sh_screen_coords[flat_ny_idx];
+                    //                 if (n_scr.x >= pix.x && n_scr.x < (pix.x + 1.0f) && n_scr.y >= pix.y && n_scr.y < (pix.y + 1.0f)) occ_y_n=1;
+                    //             }
+                    //         } grad_y_pixel += stencil_coeffs_y[s] * (float)occ_y_n;
+                    //         int nz = z_c + stencil_relative_offset;
+                    //         if (nz >= 0 && nz < grid_size) {
+                    //             uint32_t flat_nz_idx = (uint32_t)nz * grid_size * grid_size + (uint32_t)y_c * grid_size + (uint32_t)x_c;
+                    //             if (flat_nz_idx < MAX_GRID_VOLUME_BW) {
+                    //                 float2 n_scr = sh_screen_coords[flat_nz_idx];
+                    //                 if (n_scr.x >= pix.x && n_scr.x < (pix.x+1.0f) && n_scr.y >= pix.y && n_scr.y < (pix.y+1.0f)) occ_z_n=1;
+                    //             }
+                    //         } grad_z_pixel += stencil_coeffs_z[s] * (float)occ_z_n;
+                    //     }
+                    // } else {
+                    //     float2 c_scr = sh_screen_coords[flat_idx_center];
+                    //     if (c_scr.x >= pix.x && c_scr.x < (pix.x + 1.0f) && c_scr.y >= pix.y && c_scr.y < (pix.y + 1.0f)) {
+                    //         grad_x_pixel = 1.0f; grad_y_pixel = 1.0f; grad_z_pixel = 1.0f;
+                    //     }
+                    // }
+                    if ((!(current_proj.x >= pix.x && current_proj.x < (pix.x + 1.0f) &&
+                                        current_proj.y >= pix.y && current_proj.y < (pix.y + 1.0f)))  || (sh_confidence[flat_idx_center] <= 0.0f)){
+                        continue;
+                    }   
                     if (stencil_size > 0) {
                         for (int s = 0; s < stencil_size; s++) {
                             int stencil_relative_offset = s - stencil_offset;
-                            char occ_x_n = 0, occ_y_n = 0, occ_z_n = 0;
-                            int nx = x_c + stencil_relative_offset;
-                            if (nx >= 0 && nx < grid_size) {
-                                uint32_t flat_nx_idx = (uint32_t)z_c * grid_size * grid_size + (uint32_t)y_c * grid_size + (uint32_t)nx;
-                                if (flat_nx_idx < MAX_GRID_VOLUME_BW) {
-                                    float2 n_scr = sh_screen_coords[flat_nx_idx];
-                                    if (n_scr.x >= pix.x && n_scr.x < (pix.x + 1.0f) &&
-                                        n_scr.y >= pix.y && n_scr.y < (pix.y + 1.0f)) occ_x_n=1;
+                            char occ_x_neighbor = 0, occ_y_neighbor = 0, occ_z_neighbor = 0;
+
+                            // X-gradient neighbor
+                            int nx_coord = x_c + stencil_relative_offset;
+                            if (nx_coord >= 0 && nx_coord < grid_size) { // Check bounds for neighbor grid coord
+                                uint32_t flat_nx_idx = (uint32_t)z_c * grid_size * grid_size + (uint32_t)y_c * grid_size + (uint32_t)nx_coord;
+                                if (flat_nx_idx < MAX_GRID_VOLUME_BW) { // Check bounds for flat index
+                                    
+                                    if (sh_confidence[flat_nx_idx] > 0.0f) {
+                                        grad_x += stencil_coeffs_x[s];
+                                    }
                                 }
-                            } grad_x_pixel += stencil_coeffs_x[s] * (float)occ_x_n;
-                            int ny = y_c + stencil_relative_offset;
-                            if (ny >= 0 && ny < grid_size) {
-                                uint32_t flat_ny_idx = (uint32_t)z_c * grid_size * grid_size + (uint32_t)ny * grid_size + (uint32_t)x_c;
+                            }
+ 
+                            // Y-gradient neighbor
+                            int ny_coord = y_c + stencil_relative_offset;
+                            if (ny_coord >= 0 && ny_coord < grid_size) { 
+                                uint32_t flat_ny_idx = (uint32_t)z_c * grid_size * grid_size + (uint32_t)ny_coord * grid_size + (uint32_t)x_c;
                                 if (flat_ny_idx < MAX_GRID_VOLUME_BW) {
-                                    float2 n_scr = sh_screen_coords[flat_ny_idx];
-                                    if (n_scr.x >= pix.x && n_scr.x < (pix.x + 1.0f) && n_scr.y >= pix.y && n_scr.y < (pix.y + 1.0f)) occ_y_n=1;
+                                    if (sh_confidence[flat_ny_idx] > 0.0f) {
+                                        grad_y += stencil_coeffs_y[s];
+                                    }
                                 }
-                            } grad_y_pixel += stencil_coeffs_y[s] * (float)occ_y_n;
-                            int nz = z_c + stencil_relative_offset;
-                            if (nz >= 0 && nz < grid_size) {
-                                uint32_t flat_nz_idx = (uint32_t)nz * grid_size * grid_size + (uint32_t)y_c * grid_size + (uint32_t)x_c;
+                            }
+ 
+                            // Z-gradient neighbor
+                            int nz_coord = z_c + stencil_relative_offset;
+                            if (nz_coord >= 0 && nz_coord < grid_size) { 
+                                uint32_t flat_nz_idx = (uint32_t)nz_coord * grid_size * grid_size + (uint32_t)y_c * grid_size + (uint32_t)x_c;
                                 if (flat_nz_idx < MAX_GRID_VOLUME_BW) {
-                                    float2 n_scr = sh_screen_coords[flat_nz_idx];
-                                    if (n_scr.x >= pix.x && n_scr.x < (pix.x+1.0f) && n_scr.y >= pix.y && n_scr.y < (pix.y+1.0f)) occ_z_n=1;
+                                    if (sh_confidence[flat_nz_idx] > 0.0f) {
+                                        grad_z += stencil_coeffs_z[s];
+                                    }
                                 }
-                            } grad_z_pixel += stencil_coeffs_z[s] * (float)occ_z_n;
+                            }
                         }
-                    } else {
-                        float2 c_scr = sh_screen_coords[flat_idx_center];
-                        if (c_scr.x >= pix.x && c_scr.x < (pix.x + 1.0f) && c_scr.y >= pix.y && c_scr.y < (pix.y + 1.0f)) {
-                            grad_x_pixel = 1.0f; grad_y_pixel = 1.0f; grad_z_pixel = 1.0f;
+                    } else { // No stencil / point sampling - check only the center point
+                        float2 center_screen_coords = sh_screen_coords[flat_idx_center];
+                        if (center_screen_coords.x >= pix.x && center_screen_coords.x < (pix.x + 1.0f) &&
+                            center_screen_coords.y >= pix.y && center_screen_coords.y < (pix.y + 1.0f)) {
+                            // If point sampling, and it's in the pixel, it has full "gradient" or contribution
+                            // The concept of gradient is a bit different here.
+                            // Let's assume a default contribution if it's in the pixel.
+                            // This part might need refinement based on desired behavior for stencil_size == 0
+                            grad_x = 1.0f; // Or some other default to indicate presence
+                            grad_y = 1.0f;
+                            grad_z = 1.0f; 
+                            // Or, occupancy_grad_magnitude could be set directly to 1.0f here.
                         }
                     }
-                    float occupancy_grad_magnitude_pixel = fabsf(grad_x_pixel) + fabsf(grad_y_pixel) + fabsf(grad_z_pixel) + 1.0f; // L1 norm + 1
+                    float occupancy_grad_magnitude_pixel = fabsf(grad_x) + fabsf(grad_y) + fabsf(grad_z); // MODIFIED: L1 norm (consistent with human edit)
 
                     bool check_occ_grad_mag = occupancy_grad_magnitude_pixel > 1e-7f;
-                    if (pix_id == DEBUG_PIX_ID && flat_idx_center == 0) { // Print for first grid point only
-                        printf("[BKWD_DBG P:%u S2A GridLoopCheck] flat_idx_center=%u, Checking occ_grad_mag_pixel=%f > 1e-7f -> %d\n",
-                               pix_id, flat_idx_center, occupancy_grad_magnitude_pixel, check_occ_grad_mag);
-                    }
+                    // if (pix_id == DEBUG_PIX_ID && flat_idx_center == 0) { // Print for first grid point only
+                    //     printf("[BKWD_DBG P:%u S2A GridLoopCheck] flat_idx_center=%u, Checking occ_grad_mag_pixel=%f > 1e-7f -> %d\n",
+                    //            pix_id, flat_idx_center, occupancy_grad_magnitude_pixel, check_occ_grad_mag);
+                    // }
 
-                    if (check_occ_grad_mag) { // Note: was > 1e-7f, L1+1 ensures >1 if any contribution
+                    if (check_occ_grad_mag) { 
                         float weight_pixel = sh_confidence[flat_idx_center] * occupancy_grad_magnitude_pixel;
+                        
+                        // Accumulate for mlp_input_aggregated_pixel (sum of weighted raw features)
                         float* interpolated_features_sh = &sh_interpolated_features_for_primitive[flat_idx_center * MAX_INPUT_LINEAR_DIM_BW];
                         for (uint32_t f_idx = 0; f_idx < input_linear_dim; ++f_idx) {
                              if (f_idx < MAX_INPUT_LINEAR_DIM_BW) { // Boundary check for mlp_input_aggregated_pixel
                                 mlp_input_aggregated_pixel[f_idx] += interpolated_features_sh[f_idx] * weight_pixel;
                              }
                         }
-                    }
-                } // End loop over grid points for mlp_input_aggregated_pixel
 
-                // Apply Linear Layer (MLP) for this pixel
-                float primitive_outputs_pre_activation_pixel[MAX_OUTPUT_LINEAR_DIM_BW];
-                for(uint32_t i=0; i<output_linear_dim; ++i) primitive_outputs_pre_activation_pixel[i] = 0.0f;
-                for(uint32_t i=output_linear_dim; i<MAX_OUTPUT_LINEAR_DIM_BW; ++i) primitive_outputs_pre_activation_pixel[i] = 0.0f;
-
-
-                for (uint32_t out_f = 0; out_f < output_linear_dim; ++out_f) {
-                    if (out_f < MAX_OUTPUT_LINEAR_DIM_BW) { // Check against shared_linear_bias and primitive_outputs_pre_activation_pixel size
-                        float dot_prod = shared_linear_bias[out_f];
-                        for (uint32_t in_f = 0; in_f < input_linear_dim; ++in_f) {
-                            if (in_f < MAX_INPUT_LINEAR_DIM_BW) { // Check against shared_linear_weights and mlp_input_aggregated_pixel size
-                                dot_prod += shared_linear_weights[out_f * MAX_INPUT_LINEAR_DIM_BW + in_f] * mlp_input_aggregated_pixel[in_f];
+                        // Accumulate for aggregated_mlp_times_features_pixel
+                        // sh_mlp_output_per_grid_point (from STAGE 1) now stores (Weights * raw_features_grid_point)
+                        float* current_grid_point_mlp_output_sh = &sh_mlp_output_per_grid_point[flat_idx_center * MAX_OUTPUT_LINEAR_DIM_BW];
+                        for (uint32_t out_f = 0; out_f < output_linear_dim; ++out_f) {
+                            if (out_f < MAX_OUTPUT_LINEAR_DIM_BW) {
+                                 aggregated_mlp_times_features_pixel[out_f] += current_grid_point_mlp_output_sh[out_f] * weight_pixel;
                             }
                         }
-                        primitive_outputs_pre_activation_pixel[out_f] = dot_prod;
                     }
-                }
+                } // End loop over grid points for mlp_input_aggregated_pixel and aggregated_mlp_times_features_pixel
+
+                // Apply Bias for this pixel to get pre-activation values
+                float primitive_outputs_pre_activation_pixel[MAX_OUTPUT_LINEAR_DIM_BW];
+                for(uint32_t i=0; i<output_linear_dim; ++i) primitive_outputs_pre_activation_pixel[i] = aggregated_mlp_times_features_pixel[i] + shared_linear_bias[i]; // Initialize
+                // for(uint32_t i=output_linear_dim; i<MAX_OUTPUT_LINEAR_DIM_BW; ++i) primitive_outputs_pre_activation_pixel[i] = 0.0f;
+
+
+               
 
                 // Apply Activations for this pixel
                 float Blend_k_pixel[KERNEL_MAX_BLEND_DIM_USED]; // Max sized for safety
-                for(uint32_t i=0; i<blend_dim; ++i) Blend_k_pixel[i] = 0.0f;
-                for(uint32_t i=blend_dim; i<KERNEL_MAX_BLEND_DIM_USED; ++i) Blend_k_pixel[i] = 0.0f;
+                for(uint32_t i=0; i<blend_dim; ++i) Blend_k_pixel[i] = 0.0f; // Initialize relevant part
+                for(uint32_t i=blend_dim; i<KERNEL_MAX_BLEND_DIM_USED; ++i) Blend_k_pixel[i] = 0.0f; // Initialize rest
 
                 float primitive_density_k_pixel = 0.0f;
 
-                for (uint32_t k_blend = 0; k_blend < blend_dim; ++k_blend) {
-                    if (k_blend < output_linear_dim && k_blend < MAX_OUTPUT_LINEAR_DIM_BW) { // Check pre_activation index
-                        Blend_k_pixel[k_blend] = 1.0f / (1.0f + expf(-primitive_outputs_pre_activation_pixel[k_blend]));
+                // Unified activation loop, mirroring forward pass
+                for (uint32_t k_act = 0; k_act < output_linear_dim; ++k_act) {
+                    if (k_act < MAX_OUTPUT_LINEAR_DIM_BW) { // Check bounds for primitive_outputs_pre_activation_pixel
+                        if (k_act < blend_dim) { // Color and feature components (Sigmoid)
+                            // blend_dim is CHANNELS + output_feature_dim
+                            // output_linear_dim is CHANNELS + output_feature_dim + 1
+                            // So k_act < blend_dim is equivalent to k_act < output_linear_dim - 1
+                            if (k_act < KERNEL_MAX_BLEND_DIM_USED) { // Check bounds for Blend_k_pixel
+                                Blend_k_pixel[k_act] = 1.0f / (1.0f + expf(-primitive_outputs_pre_activation_pixel[k_act]));
+                            }
+                        } else { // Density component (Exp) - This is when k_act == output_linear_dim - 1
+                            primitive_density_k_pixel = expf(primitive_outputs_pre_activation_pixel[k_act]);
+                            // Removed: primitive_density_k_pixel = max(0.0f, primitive_density_k_pixel);
+                            // to strictly match the forward pass snippet which only has expf() for density.
+                        }
                     }
                 }
-                uint32_t density_idx_mlp = output_linear_dim - 1;
-                if (density_idx_mlp < MAX_OUTPUT_LINEAR_DIM_BW) { // Check pre_activation index
-                    primitive_density_k_pixel = expf(primitive_outputs_pre_activation_pixel[density_idx_mlp]);
-                    primitive_density_k_pixel = max(0.0f, primitive_density_k_pixel);
-                }
-                
-                float alpha_k_pixel = 1.0f - expf(-primitive_density_k_pixel * delta_t_k);
-                alpha_k_pixel = min(max(alpha_k_pixel, 0.0f), 1.0f);
+                // uint32_t density_idx_mlp = output_linear_dim - 1; // This is implicitly handled by the loop's else case
 
-                // (B) Perform backward step for this contribution
-                float T_before_pixel = 0.0f;
-                float one_minus_alpha_pixel = 1.0f - alpha_k_pixel;
-                bool check_one_minus_alpha = fabsf(one_minus_alpha_pixel) > 1e-6f;
-                 if (pix_id == DEBUG_PIX_ID) {
-                    printf("[BKWD_DBG P:%u S2B TBeforeCheck] Checking fabsf(one_minus_alpha_pixel=%f) > 1e-6f -> %d\n",
-                           pix_id, one_minus_alpha_pixel, check_one_minus_alpha);
-                 }
-                if (check_one_minus_alpha) {
-                    T_before_pixel = T_current_pixel / one_minus_alpha_pixel;
-                    T_before_pixel = min(max(T_before_pixel, 0.0f), 1.0f);
-                } else { 
-                    T_before_pixel = 0.0f; 
-                    if (pix_id == DEBUG_PIX_ID) {
-                        printf("[BKWD_DBG P:%u S2B TBeforeCheck] Result: T_before_pixel set to 0.\n", pix_id);
-                    }
-                }
-
+                // (B) Backward Blending and MLP Gradients
                 float dL_dBlend_k_pixel[KERNEL_MAX_BLEND_DIM_USED];
                 for(int d=0; d<blend_dim; ++d) {
                     if (d < KERNEL_MAX_BLEND_DIM_USED) {
-                        dL_dBlend_k_pixel[d] = dL_dOut_pix_local[d] * T_before_pixel * alpha_k_pixel;
-                    } else { dL_dBlend_k_pixel[d] = 0.0f; }
+                        dL_dBlend_k_pixel[d] = dL_dOut_pix_local[d] * Blend_k_pixel[d];
+                    }
                 }
 
                 float dL_dalpha_k_pixel = 0.0f;
                 for(int d=0; d<blend_dim; ++d) {
                     if (d < KERNEL_MAX_BLEND_DIM_USED) {
-                        dL_dalpha_k_pixel += dL_dOut_pix_local[d] * T_before_pixel * (Blend_k_pixel[d] - accum_blend_after[d]);
+                        dL_dalpha_k_pixel += dL_dBlend_k_pixel[d] * (Blend_k_pixel[d] - accum_blend_after[d]);
                     }
                 }
 
@@ -539,10 +595,10 @@ unifiedBackwardKernel(
                         dL_dLinearOutput_k_pixel[k] = dL_dBlend_k_pixel[k] * y * (1.0f - y);
                     }
                 }
-                float dL_ddensity_pixel = dL_dalpha_k_pixel * expf(-primitive_density_k_pixel * delta_t_k) * delta_t_k;
+                float dL_ddensity_pixel = dL_dalpha_k_pixel * primitive_density_k_pixel * delta_t_k;
                 float dL_dx_density_pixel = dL_ddensity_pixel * primitive_density_k_pixel;
-                if (density_idx_mlp < MAX_OUTPUT_LINEAR_DIM_BW) {
-                    dL_dLinearOutput_k_pixel[density_idx_mlp] = dL_dx_density_pixel;
+                if (output_linear_dim - 1 < MAX_OUTPUT_LINEAR_DIM_BW) {
+                    dL_dLinearOutput_k_pixel[output_linear_dim - 1] = dL_dx_density_pixel;
                 }
 
                 float dL_dLinearInput_k_pixel[MAX_INPUT_LINEAR_DIM_BW]; // Grad w.r.t mlp_input_aggregated_pixel
@@ -565,25 +621,25 @@ unifiedBackwardKernel(
                 for (uint32_t k_out = 0; k_out < output_linear_dim; ++k_out) {
                     if (k_out >= MAX_OUTPUT_LINEAR_DIM_BW) continue;
                     float dL_dOutput_k = dL_dLinearOutput_k_pixel[k_out];
-                    if (pix_id == DEBUG_PIX_ID && fabsf(dL_dOutput_k) > 1e-9f) { // Print if non-trivial
-                        printf("[BKWD_DBG P:%u S2B BiasGrad] k_out=%u, PRE-ATOMIC dL_dLinearBias += %f\n", pix_id, k_out, dL_dOutput_k);
-                    }
+                    // if (pix_id == DEBUG_PIX_ID && fabsf(dL_dOutput_k) > 1e-9f) { // Print if non-trivial
+                    //     printf("[BKWD_DBG P:%u S2B BiasGrad] k_out=%u, PRE-ATOMIC dL_dLinearBias += %f\n", pix_id, k_out, dL_dOutput_k);
+                    // }
                     atomicAdd(&dL_dLinearBias[k_out], dL_dOutput_k); // dL_dLinearBias is global
                     for (uint32_t j_in = 0; j_in < input_linear_dim; ++j_in) {
                         if (j_in >= MAX_INPUT_LINEAR_DIM_BW) continue;
                         float input_j = mlp_input_aggregated_pixel[j_in];
                         float dL_dW_kj = dL_dOutput_k * input_j;
-                        if (pix_id == DEBUG_PIX_ID && fabsf(dL_dW_kj) > 1e-9f) { // Print if non-trivial
-                            printf("[BKWD_DBG P:%u S2B WeightGrad] k_out=%u, j_in=%u, PRE-ATOMIC dL_dLinearWeights += %f (dL_dOutput_k=%f, input_j=%f)\n",
-                                   pix_id, k_out, j_in, dL_dW_kj, dL_dOutput_k, input_j);
-                        }
+                        // if (pix_id == DEBUG_PIX_ID && fabsf(dL_dW_kj) > 1e-9f) { // Print if non-trivial
+                        //     printf("[BKWD_DBG P:%u S2B WeightGrad] k_out=%u, j_in=%u, PRE-ATOMIC dL_dLinearWeights += %f (dL_dOutput_k=%f, input_j=%f)\n",
+                        //            pix_id, k_out, j_in, dL_dW_kj, dL_dOutput_k, input_j);
+                        // }
                         uint64_t weight_idx_global = (uint64_t)k_out * input_linear_dim + j_in; // Global layout assumed [out_dim_runtime, in_dim_runtime]
                         if (weight_idx_global < (uint64_t)input_linear_dim * output_linear_dim) {
                              atomicAdd(&dL_dLinearWeights[weight_idx_global], dL_dW_kj); // dL_dLinearWeights is global
                         }
                     }
                 }
-
+                float occupancy_grad_sum = 0.0f;
                 // (C) Backward Feature/Confidence Integration
                 for (uint32_t flat_idx_gj = 0; flat_idx_gj < grid_volume; ++flat_idx_gj) {
                     if (flat_idx_gj >= MAX_GRID_VOLUME_BW) continue;
@@ -630,13 +686,13 @@ unifiedBackwardKernel(
                             grad_x_pgj=1.0f; grad_y_pgj=1.0f; grad_z_pgj=1.0f;
                         }
                     }
-                    float occ_grad_mag_pixel_gj = fabsf(grad_x_pgj) + fabsf(grad_y_pgj) + fabsf(grad_z_pgj) + 1.0f;
-
+                    float occ_grad_mag_pixel_gj = fabsf(grad_x_pgj) + fabsf(grad_y_pgj) + fabsf(grad_z_pgj); // MODIFIED: L1 norm
+                    occupancy_grad_sum += occ_grad_mag_pixel_gj;
                     bool check_occ_grad_mag_gj = occ_grad_mag_pixel_gj > 1e-7f;
-                    if (pix_id == DEBUG_PIX_ID && flat_idx_gj == 0) { // Print for first grid point only
-                        printf("[BKWD_DBG P:%u S2C ConfCheck] flat_idx_gj=%u, Checking occ_grad_mag_pixel_gj=%f > 1e-7f -> %d\n",
-                               pix_id, flat_idx_gj, occ_grad_mag_pixel_gj, check_occ_grad_mag_gj);
-                    }
+                    // if (pix_id == DEBUG_PIX_ID && flat_idx_gj == 0) { // Print for first grid point only
+                    //     printf("[BKWD_DBG P:%u S2C ConfCheck] flat_idx_gj=%u, Checking occ_grad_mag_pixel_gj=%f > 1e-7f -> %d\n",
+                    //            pix_id, flat_idx_gj, occ_grad_mag_pixel_gj, check_occ_grad_mag_gj);
+                    // }
 
                     if (check_occ_grad_mag_gj) {
                         float* phi_interp_gj_sh = &sh_interpolated_features_for_primitive[flat_idx_gj * MAX_INPUT_LINEAR_DIM_BW];
@@ -647,20 +703,20 @@ unifiedBackwardKernel(
                             }
                         }
                         dL_dX_gj *= occ_grad_mag_pixel_gj;
-                        if (pix_id == DEBUG_PIX_ID && fabsf(dL_dX_gj) > 1e-9f) { // Print if non-trivial
-                             printf("[BKWD_DBG P:%u S2C ConfGrad] flat_idx_gj=%u, PRE-ATOMIC dL_dprimitive_confidences += %f\n",
-                                    pix_id, flat_idx_gj, dL_dX_gj);
-                        }
+                        // if (pix_id == DEBUG_PIX_ID && fabsf(dL_dX_gj) > 1e-9f) { // Print if non-trivial
+                        //      printf("[BKWD_DBG P:%u S2C ConfGrad] flat_idx_gj=%u, PRE-ATOMIC dL_dprimitive_confidences += %f\n",
+                        //             pix_id, flat_idx_gj, dL_dX_gj);
+                        // }
                         atomicAdd(&dL_dprimitive_confidences[(uint64_t)current_primitive_idx_for_block * grid_volume + flat_idx_gj], dL_dX_gj);
 
                         float current_conf_gj_sh = sh_confidence[flat_idx_gj];
                         float weight_gj_pixel = occ_grad_mag_pixel_gj * current_conf_gj_sh;
 
                         bool check_weight_gj = fabsf(weight_gj_pixel) > 1e-9f;
-                        if (pix_id == DEBUG_PIX_ID && flat_idx_gj == 0) { // Print for first grid point only
-                            printf("[BKWD_DBG P:%u S2C FeatCheck] flat_idx_gj=%u, Checking fabsf(weight_gj_pixel=%f) > 1e-9f -> %d\n",
-                                   pix_id, flat_idx_gj, weight_gj_pixel, check_weight_gj);
-                        }
+                        // if (pix_id == DEBUG_PIX_ID && flat_idx_gj == 0) { // Print for first grid point only
+                        //     printf("[BKWD_DBG P:%u S2C FeatCheck] flat_idx_gj=%u, Checking fabsf(weight_gj_pixel=%f) > 1e-9f -> %d\n",
+                        //            pix_id, flat_idx_gj, weight_gj_pixel, check_weight_gj);
+                        // }
 
                         if (check_weight_gj) {
                             float dL_dPhi_level_gj[MAX_INPUT_FEATURE_DIM_BW]; // For one level
@@ -691,15 +747,15 @@ unifiedBackwardKernel(
                                         }
                                     } else { dL_dPhi_level_gj[f_level] = 0.0f; } // Should not happen if MAX_INPUT_FEATURE_DIM_BW >= input_feature_dim
                                 }
-                                if (pix_id == DEBUG_PIX_ID && flat_idx_gj == 0) { // Print for first grid point only
-                                    printf("[BKWD_DBG P:%u S2C HashGradCheck] flat_idx_gj=%u, level=%d, Checking level_has_features -> %d\n",
-                                           pix_id, flat_idx_gj, level, level_has_features);
-                                }
+                                // if (pix_id == DEBUG_PIX_ID && flat_idx_gj == 0) { // Print for first grid point only
+                                //     printf("[BKWD_DBG P:%u S2C HashGradCheck] flat_idx_gj=%u, level=%d, Checking level_has_features -> %d\n",
+                                //            pix_id, flat_idx_gj, level, level_has_features);
+                                // }
                                 if (level_has_features) {
-                                    if (pix_id == DEBUG_PIX_ID && flat_idx_gj == 0 && input_feature_dim > 0 && fabsf(dL_dPhi_level_gj[0]) > 1e-9f) {
-                                        printf("[BKWD_DBG P:%u S2C HashGradCall] flat_idx_gj=%u, level=%d, Calling hashComputeGradient with dL_dPhi_level_gj[0]=%f\n",
-                                               pix_id, flat_idx_gj, level, dL_dPhi_level_gj[0]);
-                                    }
+                                    // if (pix_id == DEBUG_PIX_ID && flat_idx_gj == 0 && input_feature_dim > 0 && fabsf(dL_dPhi_level_gj[0]) > 1e-9f) {
+                                    //     printf("[BKWD_DBG P:%u S2C HashGradCall] flat_idx_gj=%u, level=%d, Calling hashComputeGradient with dL_dPhi_level_gj[0]=%f\n",
+                                    //            pix_id, flat_idx_gj, level, dL_dPhi_level_gj[0]);
+                                    // }
                                     hashComputeGradient(
                                         pos_world_gj, level, resolution, (do_hash[level] != 0), primes,
                                         dL_dPhi_level_gj, input_feature_dim, hashgrid_levels,
@@ -714,25 +770,25 @@ unifiedBackwardKernel(
                 // (D) Update per-pixel backward state
                 for(int d=0; d<blend_dim; ++d) {
                     if (d < KERNEL_MAX_BLEND_DIM_USED) {
-                        dL_dOut_pix_local[d] *= one_minus_alpha_pixel;
-                        accum_blend_after[d] = Blend_k_pixel[d] * alpha_k_pixel + accum_blend_after[d] * one_minus_alpha_pixel;
+                        dL_dOut_pix_local[d] *= Blend_k_pixel[d];
+                        accum_blend_after[d] = Blend_k_pixel[d] + accum_blend_after[d] * (1.0f - Blend_k_pixel[d]);
                     }
                 }
-                T_current_pixel = T_before_pixel;
+                T_current_pixel = Blend_k_pixel[output_linear_dim - 1];
                 current_pixel_next_contrib_idx--;
-                if (pix_id == DEBUG_PIX_ID) {
-                    printf("[BKWD_DBG P:%u S2D Update] Next dL_dOut_pix_local[0]=%f, Next T_current_pixel=%f, next_contrib_idx=%d\n",
-                           pix_id, (blend_dim > 0 ? dL_dOut_pix_local[0] : 0.0f), T_current_pixel, current_pixel_next_contrib_idx);
-                }
+                // if (pix_id == DEBUG_PIX_ID) {
+                //     printf("[BKWD_DBG P:%u S2D Update] Next dL_dOut_pix_local[0]=%f, Next T_current_pixel=%f, next_contrib_idx=%d\n",
+                //            pix_id, (blend_dim > 0 ? dL_dOut_pix_local[0] : 0.0f), T_current_pixel, current_pixel_next_contrib_idx);
+                // }
             } // end if (primitive_matches_pixel)
         } // end if (should_process_pixel)
         block.sync(); // Ensure all threads complete work for current_primitive_idx_for_block
     } // --- End Loop Over Primitives for Tile (k_rev_tile) ---
 
-    if (pix_id == DEBUG_PIX_ID) { // Final state for the debug pixel
-        printf("[BKWD_DBG P:%u KERNEL END] Final T_current_pixel=%f, Final dL_dOut_pix_local[0]=%f\n",
-               pix_id, T_current_pixel, (blend_dim > 0 ? dL_dOut_pix_local[0] : 0.0f));
-    }
+    // if (pix_id == DEBUG_PIX_ID) { // Final state for the debug pixel
+    //     printf("[BKWD_DBG P:%u KERNEL END] Final T_current_pixel=%f, Final dL_dOut_pix_local[0]=%f\n",
+    //            pix_id, T_current_pixel, (blend_dim > 0 ? dL_dOut_pix_local[0] : 0.0f));
+    // }
 }
 
 

@@ -2,7 +2,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio> // For printf
-#include <cmath> // <<< Add for floorf, powf >>>
+#include <cmath> // <<< Add for floorf, powf, fmaxf, fminf >>>
 #include <vector_types.h> // <<< Add for float3, int3 >>>
 #include "auxiliary.h" // <<< ADDED: Include for transformPoint4x4 if used here >>>
 
@@ -19,10 +19,22 @@ __device__ inline void hashComputeGradient(
     const uint64_t feature_table_size,  // Total size of the feature table buffer (use uint64_t for large tables)
     float* __restrict__ dL_dfeature_table // Output: Global gradient buffer for features (atomicAdd target)
 ) {
+    // --- Normalize pos_world from scene bounds (e.g., [-1.3, 1.3]) to [0,1] ---
+    const float scene_min_val = -1.3f;
+    const float scene_extent = 2.6f; // 1.3f - (-1.3f)
+
+    float norm_x = (pos_world.x - scene_min_val) / scene_extent;
+    float norm_y = (pos_world.y - scene_min_val) / scene_extent;
+    float norm_z = (pos_world.z - scene_min_val) / scene_extent;
+
+    // Clamp to [0,1] to handle points slightly outside bounds or precision issues
+    norm_x = fmaxf(0.0f, fminf(1.0f, norm_x));
+    norm_y = fmaxf(0.0f, fminf(1.0f, norm_y));
+    norm_z = fmaxf(0.0f, fminf(1.0f, norm_z));
+
     // --- Calculate grid coordinates and weights (Must match hashInterpolate) ---
     int res = resolution_table[level];
-    float level_scale = powf(2.0f, (float)level); // MUST BE CONSISTENT with hashInterpolate
-    float3 pos_level = make_float3(pos_world.x * level_scale, pos_world.y * level_scale, pos_world.z * level_scale);
+    float3 pos_level = make_float3(norm_x * res, norm_y * res, norm_z * res);
     float3 floor_val = make_float3(floorf(pos_level.x), floorf(pos_level.y), floorf(pos_level.z));
     int3 grid_coords_base = make_int3((int)floor_val.x, (int)floor_val.y, (int)floor_val.z);
     float3 weights = make_float3(pos_level.x - floor_val.x, pos_level.y - floor_val.y, pos_level.z - floor_val.z);
@@ -101,15 +113,35 @@ __forceinline__ __device__ void hashInterpolate(
     const uint32_t input_feature_dim,   // F (features_per_level)
     const uint32_t hashgrid_levels      // L (total_hashgrid_levels)
 ) {
+    // --- Normalize pos from scene bounds (e.g., [-1.3, 1.3]) to [0,1] ---
+    // This normalization makes it consistent with hashInterpolateShared and hashComputeGradient's expected input processing.
+    // However, this function also has a 'level_scale = powf(2.0f, level)' which is used differently.
+    // For consistency with the other two functions, we should normalize to [0,1] first,
+    // and then the `pos.x * res` logic (if `res` was `resolutions[level]`) would apply.
+    // The current `level_scale` logic here is a bit different.
+    // If this function needs to match hashInterpolateShared, it should be refactored.
+    // For now, applying the same initial normalization for clarity if it were to be aligned.
+
+    const float scene_min_val = -1.3f;
+    const float scene_extent = 2.6f; // 1.3f - (-1.3f)
+
+    float norm_x_in = (pos.x - scene_min_val) / scene_extent;
+    float norm_y_in = (pos.y - scene_min_val) / scene_extent;
+    float norm_z_in = (pos.z - scene_min_val) / scene_extent;
+
+    norm_x_in = fmaxf(0.0f, fminf(1.0f, norm_x_in));
+    norm_y_in = fmaxf(0.0f, fminf(1.0f, norm_y_in));
+    norm_z_in = fmaxf(0.0f, fminf(1.0f, norm_z_in));
+
     // Get resolution for this level
     int res = resolutions[level];
 
     // --- Calculate grid coordinates and weights (Must match hashComputeGradient) ---
-    float level_scale = powf(2.0f, (float)level); 
-    float3 pos_level = make_float3(pos.x * level_scale, pos.y * level_scale, pos.z * level_scale);
-    float3 floor_val = make_float3(floorf(pos_level.x), floorf(pos_level.y), floorf(pos_level.z));
+    float3 pos_scaled_for_grid = make_float3(norm_x_in * res, norm_y_in * res, norm_z_in * res);
+
+    float3 floor_val = make_float3(floorf(pos_scaled_for_grid.x), floorf(pos_scaled_for_grid.y), floorf(pos_scaled_for_grid.z));
     int3 grid_min = make_int3((int)floor_val.x, (int)floor_val.y, (int)floor_val.z);
-    float3 t = make_float3(pos_level.x - floor_val.x, pos_level.y - floor_val.y, pos_level.z - floor_val.z);
+    float3 t = make_float3(pos_scaled_for_grid.x - floor_val.x, pos_scaled_for_grid.y - floor_val.y, pos_scaled_for_grid.z - floor_val.z);
 
     // Initialize output features for this level to zero
     for (uint32_t f = 0; f < input_feature_dim; ++f) {
@@ -189,9 +221,22 @@ __forceinline__ __device__ void hashInterpolateShared(
     const uint32_t max_concatenated_features_in_slice, // Compile-time max size of the target slice (e.g., MAX_INPUT_LINEAR_DIM)
     const uint32_t runtime_concatenated_features_to_fill // Runtime total features to fill in the slice (e.g., input_linear_dim)
 ) {
+    // --- Normalize pos from scene bounds (e.g., [-1.3, 1.3]) to [0,1] ---
+    const float scene_min_val = -1.3f;
+    const float scene_extent = 2.6f; // 1.3f - (-1.3f)
+
+    float norm_x = (pos.x - scene_min_val) / scene_extent;
+    float norm_y = (pos.y - scene_min_val) / scene_extent;
+    float norm_z = (pos.z - scene_min_val) / scene_extent;
+
+    // Clamp to [0,1]
+    norm_x = fmaxf(0.0f, fminf(1.0f, norm_x));
+    norm_y = fmaxf(0.0f, fminf(1.0f, norm_y));
+    norm_z = fmaxf(0.0f, fminf(1.0f, norm_z));
+
     int res = resolutions[current_processing_level];
-    float level_scale_factor = powf(2.0f, (float)current_processing_level);
-    float3 pos_scaled_to_level = make_float3(pos.x * level_scale_factor, pos.y * level_scale_factor, pos.z * level_scale_factor);
+    // Use normalized coordinates for scaling by resolution
+    float3 pos_scaled_to_level = make_float3(norm_x * res, norm_y * res, norm_z * res);
     float3 floor_val = make_float3(floorf(pos_scaled_to_level.x), floorf(pos_scaled_to_level.y), floorf(pos_scaled_to_level.z));
     int3 grid_min_coords = make_int3((int)floor_val.x, (int)floor_val.y, (int)floor_val.z);
     float3 interp_weights_t = make_float3(pos_scaled_to_level.x - floor_val.x, pos_scaled_to_level.y - floor_val.y, pos_scaled_to_level.z - floor_val.z);

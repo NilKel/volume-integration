@@ -42,19 +42,19 @@ namespace CudaIntegrator
 		uint32_t* point_offsets; // Output of CUB scan
 		char* scanning_space;    // Temporary storage for CUB scan
 
-		static size_t required(size_t P)
-		{
-			size_t size = 0;
-			size += CUB_ROUND_UP_NEAREST(P * sizeof(float), 128); // depths
-			size += CUB_ROUND_UP_NEAREST(P * sizeof(int), 128); // internal_radii
-			size += CUB_ROUND_UP_NEAREST(P * sizeof(float2), 128); // means2D
-			size += CUB_ROUND_UP_NEAREST(P * sizeof(uint32_t), 128); // tiles_touched
-			size_t scan_bytes;
-			cub::DeviceScan::InclusiveSum(nullptr, scan_bytes, (uint32_t*)nullptr, (uint32_t*)nullptr, P);
-			size += CUB_ROUND_UP_NEAREST(scan_bytes, 128); // scanning_space
-			size += CUB_ROUND_UP_NEAREST(P * sizeof(uint32_t), 128); // point_offsets
-			return size;
-		}
+		// static size_t required(size_t P)
+		// {
+		// 	size_t size = 0;
+		// 	size += CUB_ROUND_UP_NEAREST(P * sizeof(float), 128); // depths
+		// 	size += CUB_ROUND_UP_NEAREST(P * sizeof(int), 128); // internal_radii
+		// 	size += CUB_ROUND_UP_NEAREST(P * sizeof(float2), 128); // means2D
+		// 	size += CUB_ROUND_UP_NEAREST(P * sizeof(uint32_t), 128); // tiles_touched
+		// 	size_t scan_bytes;
+		// 	cub::DeviceScan::InclusiveSum(nullptr, scan_bytes, (uint32_t*)nullptr, (uint32_t*)nullptr, P);
+		// 	size += CUB_ROUND_UP_NEAREST(scan_bytes, 128); // scanning_space
+		// 	size += CUB_ROUND_UP_NEAREST(P * sizeof(uint32_t), 128); // point_offsets
+		// 	return size;
+		// }
 
 		static inline GeometryState fromChunk(char*& chunk, size_t P) {
 			GeometryState state;
@@ -64,7 +64,8 @@ namespace CudaIntegrator
 			obtain(chunk, state.tiles_touched, P, 128);
 			cub::DeviceScan::InclusiveSum(nullptr, state.scan_size, state.tiles_touched, state.tiles_touched, P);
 			obtain(chunk, state.scanning_space, state.scan_size, 128);
-			obtain(chunk, state.point_offsets, P, 128); return state;
+			obtain(chunk, state.point_offsets, P, 128); 
+			return state;
 		}
 	};
 
@@ -76,20 +77,27 @@ namespace CudaIntegrator
 		int* pixel_contributing_indices; // size = N_pixels * max_contrib_per_pixel <<< NEW >>>
 		float* delta_t; // <<< NEW: Delta T per pixel contribution (size = N_pixels * max_contrib_per_pixel) >>>
 
-		static size_t required(size_t N_tiles, size_t N_pixels, size_t max_contrib_per_pixel)
+		// static size_t required(size_t N_tiles, size_t N_pixels, size_t max_contrib_per_pixel)
+		// {
+		// 	size_t size = 0;
+		// 	size += CUB_ROUND_UP_NEAREST(N_tiles * sizeof(uint2), 128); // ranges
+		// 	size += CUB_ROUND_UP_NEAREST(N_pixels * sizeof(float), 128); // final_transmittance <<< NEW >>>
+		// 	size += CUB_ROUND_UP_NEAREST(N_pixels * sizeof(int), 128); // num_contrib_per_pixel <<< NEW >>>
+		// 	size += CUB_ROUND_UP_NEAREST(N_pixels * max_contrib_per_pixel * sizeof(int), 128); // pixel_contributing_indices <<< NEW >>>
+		// 	size += CUB_ROUND_UP_NEAREST(N_pixels * max_contrib_per_pixel * sizeof(float), 128); // delta_t <<< NEW >>>
+		// 	return size;
+		// }
+
+		static size_t required(size_t N_pixels, size_t max_contrib_per_pixel)
 		{
-			size_t size = 0;
-			size += CUB_ROUND_UP_NEAREST(N_tiles * sizeof(uint2), 128); // ranges
-			size += CUB_ROUND_UP_NEAREST(N_pixels * sizeof(float), 128); // final_transmittance <<< NEW >>>
-			size += CUB_ROUND_UP_NEAREST(N_pixels * sizeof(int), 128); // num_contrib_per_pixel <<< NEW >>>
-			size += CUB_ROUND_UP_NEAREST(N_pixels * max_contrib_per_pixel * sizeof(int), 128); // pixel_contributing_indices <<< NEW >>>
-			size += CUB_ROUND_UP_NEAREST(N_pixels * max_contrib_per_pixel * sizeof(float), 128); // delta_t <<< NEW >>>
-			return size;
+			char* size = nullptr;
+			ImageState::fromChunk(size, N_pixels, max_contrib_per_pixel);
+			return ((size_t)size) + 128;
 		}
 
-		static inline ImageState fromChunk(char*& chunk, size_t N_tiles, size_t N_pixels, size_t max_contrib_per_pixel) {
+		static inline ImageState fromChunk(char*& chunk, size_t N_pixels, size_t max_contrib_per_pixel) {
 			ImageState state;
-			obtain(chunk, state.ranges, N_tiles, 128);
+			obtain(chunk, state.ranges, N_pixels, 128);
 			obtain(chunk, state.final_transmittance, N_pixels, 128);
 			obtain(chunk, state.num_contrib_per_pixel, N_pixels, 128);
 			obtain(chunk, state.pixel_contributing_indices, N_pixels * max_contrib_per_pixel, 128);
@@ -107,18 +115,20 @@ namespace CudaIntegrator
 		uint64_t* point_list_keys;          // Keys (Tile | Depth) after sort
 		char* list_sorting_space;           // Temporary storage for CUB sort
 
-		static size_t required(size_t P_prime)
-		{
-			size_t size = 0;
-			size += CUB_ROUND_UP_NEAREST(P_prime * sizeof(uint64_t), 128); // point_list_keys_unsorted
-			size += CUB_ROUND_UP_NEAREST(P_prime * sizeof(uint32_t), 128); // point_list_unsorted
-			size += CUB_ROUND_UP_NEAREST(P_prime * sizeof(uint64_t), 128); // point_list_keys
-			size += CUB_ROUND_UP_NEAREST(P_prime * sizeof(uint32_t), 128); // point_list
-			size_t sort_bytes;
-			cub::DeviceRadixSort::SortPairs(nullptr, sort_bytes, (uint64_t*)nullptr, (uint64_t*)nullptr, (uint32_t*)nullptr, (uint32_t*)nullptr, P_prime);
-			size += CUB_ROUND_UP_NEAREST(sort_bytes, 128); // list_sorting_space
-			return size;
-		}
+		// static size_t required(size_t P_prime)
+		// {
+		// 	size_t size = 0;
+		// 	size += CUB_ROUND_UP_NEAREST(P_prime * sizeof(uint64_t), 128); // point_list_keys_unsorted
+		// 	size += CUB_ROUND_UP_NEAREST(P_prime * sizeof(uint32_t), 128); // point_list_unsorted
+		// 	size += CUB_ROUND_UP_NEAREST(P_prime * sizeof(uint64_t), 128); // point_list_keys
+		// 	size += CUB_ROUND_UP_NEAREST(P_prime * sizeof(uint32_t), 128); // point_list
+		// 	size_t sort_bytes;
+		// 	cub::DeviceRadixSort::SortPairs(nullptr, sort_bytes, (uint64_t*)nullptr, (uint64_t*)nullptr, (uint32_t*)nullptr, (uint32_t*)nullptr, P_prime);
+		// 	size += CUB_ROUND_UP_NEAREST(sort_bytes, 128); // list_sorting_space
+		// 	return size;
+		// }
+
+		
 
 		static inline BinningState fromChunk(char*& chunk, size_t P_prime) {
 			BinningState state;
@@ -126,7 +136,6 @@ namespace CudaIntegrator
 			obtain(chunk, state.point_list_unsorted, P_prime, 128);
 			obtain(chunk, state.point_list_keys, P_prime, 128);
 			obtain(chunk, state.point_list, P_prime, 128);
-			size_t sort_bytes;
 			cub::DeviceRadixSort::SortPairs(
 				nullptr, state.sorting_size,
 				state.point_list_keys_unsorted, state.point_list_keys,
@@ -140,18 +149,26 @@ namespace CudaIntegrator
 	template<typename T>
 	size_t required(size_t P_or_N); // General declaration (can be removed if only specializations are used)
 
-	template<> // Specialization for GeometryState
-	inline size_t required<GeometryState>(size_t P) {
-		return GeometryState::required(P); // Now GeometryState is fully defined
-	}
+	// template<> // Specialization for GeometryState
+	// inline size_t required<GeometryState>(size_t P) {
+	// 	return GeometryState::required(P); // Now GeometryState is fully defined
+	// }
 
-	inline size_t requiredImage(size_t N_tiles, size_t N_pixels, size_t max_contrib_per_pixel) {
-		return ImageState::required(N_tiles, N_pixels, max_contrib_per_pixel); // Now ImageState is fully defined
-	}
+	// inline size_t requiredImage(size_t N_tiles, size_t N_pixels, size_t max_contrib_per_pixel) {
+	// 	return ImageState::required(N_tiles, N_pixels, max_contrib_per_pixel); // Now ImageState is fully defined
+	// }
 
-	template<> // Specialization for BinningState
-	inline size_t required<BinningState>(size_t P_prime) {
-		return BinningState::required(P_prime); // Now BinningState is fully defined
+	// template<> // Specialization for BinningState
+	// inline size_t required<BinningState>(size_t P_prime) {
+	// 	return BinningState::required(P_prime); // Now BinningState is fully defined
+	// }
+
+	template<typename T> 
+	size_t required(size_t P)
+	{
+		char* size = nullptr;
+		T::fromChunk(size, P);
+		return ((size_t)size) + 128;
 	}
 
 	// Add a return struct definition (can be inside the namespace or globally)

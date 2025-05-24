@@ -54,6 +54,7 @@ IntegratePrimitivesCUDA(
 	// Runtime Dimensions
 	const uint32_t input_feature_dim,           // F: Feature dimension in hashgrid
 	const uint32_t output_feature_dim,          // Output feature dimension (excluding RGB, density)
+	const uint32_t intermediate_feature_dim,   // I: Intermediate feature dimension
 	const uint32_t hashgrid_levels,             // L: Number of hashgrid levels
 	const uint32_t num_output_channels,         // Number of color channels (e.g., 3 for RGB)
 	// Misc

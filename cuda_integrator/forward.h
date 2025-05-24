@@ -74,7 +74,7 @@ namespace FORWARD
 		const uint2* ranges,
 		const uint32_t* point_list,
 		// Image dimensions
-		int W, int H,
+		int W, int H, int P,
 		// Camera parameters
 		const float* viewmatrix,
 		const float* projmatrix,
@@ -113,6 +113,7 @@ namespace FORWARD
 		// Runtime dimensions
 		const uint32_t input_feature_dim, // Added
 		const uint32_t output_feature_dim, // Added
+		const uint32_t intermediate_feature_dim, // Added
 		const uint32_t hashgrid_levels, // Added
 		const uint32_t num_output_channels // Added (e.g., 3 for RGB)
 		);
